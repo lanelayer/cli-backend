@@ -1,0 +1,64 @@
+name: Test and Lint
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  test-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            notification-server/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('notification-server/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run cargo check
+        working-directory: ./notification-server
+        run: cargo check --all-targets
+
+      - name: Run cargo clippy
+        working-directory: ./notification-server
+        run: cargo clippy -- -D warnings
+
+      - name: Check formatting
+        working-directory: ./notification-server
+        run: cargo fmt -- --check
+
+  test-docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build docker-registry
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker-registry
+          push: false
+          tags: test-registry:latest
+
+      - name: Build notification-server
+        uses: docker/build-push-action@v6
+        with:
+          context: ./notification-server
+          push: false
+          tags: test-notification-server:latest
+

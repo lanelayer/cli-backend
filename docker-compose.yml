@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  docker-registry:
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-your-org/cli-web-runtime}/docker-registry:latest
+    build:
+      context: ./docker-registry
+      dockerfile: Dockerfile
+    ports:
+      - "${REGISTRY_PORT:-5001}:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+      - ./docker-registry/auth:/etc/docker/registry/auth:ro
+    environment:
+      - REGISTRY_HTTP_SECRET=${REGISTRY_HTTP_SECRET:-}
+      - REGISTRY_AUTH_HTPASSWD_REALM=${REGISTRY_AUTH_HTPASSWD_REALM:-Registry Realm}
+      - REGISTRY_AUTH_HTPASSWD_PATH=/etc/docker/registry/auth/htpasswd
+    restart: unless-stopped
+    networks:
+      - lane-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/v2/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  notification-server:
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-your-org/cli-web-runtime}/notification-server:latest
+    build:
+      context: ./notification-server
+      dockerfile: Dockerfile
+    ports:
+      - "${NOTIFICATION_PORT:-8000}:8000"
+    environment:
+      # Docker registry credentials (for notification server to push/pull)
+      - DOCKER_USERNAME=${DOCKER_USERNAME:-}
+      - DOCKER_PASSWORD=${DOCKER_PASSWORD:-}
+      - DOCKER_REGISTRY=${DOCKER_REGISTRY:-http://docker-registry:5000}
+      
+      # AWS/Tigris S3 credentials (for uploading exports)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-${TIGRIS_ACCESS_KEY_ID:-}}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-${TIGRIS_SECRET_ACCESS_KEY:-}}
+      - TIGRIS_ACCESS_KEY_ID=${TIGRIS_ACCESS_KEY_ID:-}
+      - TIGRIS_SECRET_ACCESS_KEY=${TIGRIS_SECRET_ACCESS_KEY:-}
+    restart: unless-stopped
+    networks:
+      - lane-network
+    depends_on:
+      docker-registry:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  lane-network:
+    driver: bridge
+
+volumes:
+  registry-data:
+    driver: local
+

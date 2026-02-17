@@ -1,0 +1,35 @@
+# Environment files
+.env.example
+.env.local
+.env.*.local
+
+# Docker registry auth (keep structure, ignore actual files)
+docker-registry/auth/htpasswd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Trashes
+
+# Rust
+target/
+**/*.rs.bk
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+lane-export-temp/
+vcr-export-temp/
+

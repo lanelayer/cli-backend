@@ -1,0 +1,36 @@
+version: 0.1
+log:
+  level: debug
+  formatter: text
+
+storage:
+  s3:
+    accesskey: ${AWS_ACCESS_KEY_ID}
+    secretkey: ${AWS_SECRET_ACCESS_KEY}
+    region: ${AWS_REGION}
+    regionendpoint: ${AWS_ENDPOINT_URL_S3}
+    bucket: ${BUCKET_NAME}
+    encrypt: true
+    secure: true
+    v4auth: true
+    chunksize: 5242880
+    multipartcopychunksize: 33554432
+    multipartcopymaxconcurrency: 100
+    multipartcopythresholdsize: 33554432
+    rootdirectory: /
+
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+
+auth:
+  htpasswd:
+    realm: basic-realm
+    path: /etc/docker/registry/auth/htpasswd

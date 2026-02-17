@@ -1,0 +1,19 @@
+# Authentication credentials
+auth/htpasswd
+
+# Environment files
+.env
+.env.local
+
+# Fly.io secrets (should be set via fly secrets command)
+# fly.toml is included but credentials should be empty
+
+# Docker volumes
+data/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
