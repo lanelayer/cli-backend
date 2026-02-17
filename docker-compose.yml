@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   docker-registry:
-    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-your-org/cli-web-runtime}/docker-registry:latest
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-your-org/cli-backend}/docker-registry:latest
     build:
       context: ./docker-registry
       dockerfile: Dockerfile
@@ -25,7 +25,7 @@ services:
       retries: 3
 
   notification-server:
-    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-your-org/cli-web-runtime}/notification-server:latest
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-your-org/cli-backend}/notification-server:latest
     build:
       context: ./notification-server
       dockerfile: Dockerfile

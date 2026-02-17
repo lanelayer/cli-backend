@@ -67,8 +67,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
-    name: Deploy (SSH + docker compose)
+  deploy-registry:
+    name: Deploy Docker Registry to Fly.io
     needs: build-and-push
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
@@ -83,57 +83,43 @@ jobs:
           REPO_NAME="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
           echo "IMAGE_PREFIX=${REPO_OWNER}/${REPO_NAME}" >> "$GITHUB_ENV"
 
-      - name: Upload docker-compose.yml to server
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT }}
-          source: "docker-compose.yml"
-          target: "/opt/cli-web-runtime"
+      - name: Setup Fly.io CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
 
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT }}
-          script: |
-            set -euo pipefail
+      - name: Deploy Docker Registry
+        working-directory: ./docker-registry
+        run: |
+          flyctl deploy \
+            --remote-only \
+            --image ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/docker-registry:${{ github.sha }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-            mkdir -p /opt/cli-web-runtime
-            cd /opt/cli-web-runtime
+  deploy-notification-server:
+    name: Deploy Notification Server to Fly.io
+    needs: [build-and-push, deploy-registry]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
 
-            # Pick compose command (supports both docker-compose and docker compose).
-            if command -v docker-compose >/dev/null 2>&1; then
-              COMPOSE="docker-compose"
-            else
-              COMPOSE="docker compose"
-            fi
+    steps:
+      - uses: actions/checkout@v4
 
-            # Write runtime env (keep this on the server; update values via GitHub secrets).
-            cat > .env << 'EOF'
-            REGISTRY=${{ env.REGISTRY }}
-            IMAGE_PREFIX=${{ env.IMAGE_PREFIX }}
-            REGISTRY_PORT=${{ secrets.REGISTRY_PORT }}
-            NOTIFICATION_PORT=${{ secrets.NOTIFICATION_PORT }}
-            DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}
-            DOCKER_PASSWORD=${{ secrets.DOCKER_PASSWORD }}
-            DOCKER_REGISTRY=${{ secrets.DOCKER_REGISTRY }}
-            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-            TIGRIS_ACCESS_KEY_ID=${{ secrets.TIGRIS_ACCESS_KEY_ID }}
-            TIGRIS_SECRET_ACCESS_KEY=${{ secrets.TIGRIS_SECRET_ACCESS_KEY }}
-            REGISTRY_HTTP_SECRET=${{ secrets.REGISTRY_HTTP_SECRET }}
-            EOF
+      - name: Compute image prefix (lowercased for GHCR)
+        shell: bash
+        run: |
+          REPO_OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          REPO_NAME="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_PREFIX=${REPO_OWNER}/${REPO_NAME}" >> "$GITHUB_ENV"
 
-            # Login to GHCR so the server can pull images.
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ${{ env.REGISTRY }} -u "${{ github.repository_owner }}" --password-stdin
+      - name: Setup Fly.io CLI
+        uses: superfly/flyctl-actions/setup-flyctl@master
 
-            # Pull + restart
-            $COMPOSE pull
-            $COMPOSE up -d --remove-orphans
-            $COMPOSE ps
+      - name: Deploy Notification Server
+        working-directory: ./notification-server
+        run: |
+          flyctl deploy \
+            --remote-only \
+            --image ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/notification-server:${{ github.sha }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
