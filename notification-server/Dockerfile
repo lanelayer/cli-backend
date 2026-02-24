@@ -1,5 +1,5 @@
-# Use the official Rust image as a builder
-FROM rust:latest as builder
+# Use the official Rust image as a builder (matching Debian Bookworm for GLIBC compatibility)
+FROM rust:1-bookworm as builder
 WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     docker.io \
+    strace \
+    file \
+    libc6 \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
@@ -24,6 +27,7 @@ RUN mkdir -p /usr/local/lib/docker/cli-plugins/ && \
     ln -sf /usr/local/lib/docker/cli-plugins/docker-buildx /usr/lib/docker/cli-plugins/docker-buildx
 
 COPY --from=builder /usr/src/app/target/release/notification-server /usr/local/bin/notification-server
+RUN chmod +x /usr/local/bin/notification-server
 COPY start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
 EXPOSE 8000
