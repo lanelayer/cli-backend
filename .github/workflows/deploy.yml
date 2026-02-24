@@ -68,7 +68,7 @@ jobs:
             echo "$REGISTRY_HTPASSWD" > docker-registry/auth/htpasswd
           else
             sudo apt-get update -qq && sudo apt-get install -y -qq apache2-utils
-            htpasswd -Bbn -c docker-registry/auth/htpasswd registryuser "$(openssl rand -base64 24)"
+            htpasswd -Bb -c docker-registry/auth/htpasswd registryuser "$(openssl rand -base64 24)"
           fi
 
       - name: Build docker-registry
@@ -124,7 +124,7 @@ jobs:
             echo "$REGISTRY_HTPASSWD" > docker-registry/auth/htpasswd
           else
             sudo apt-get update -qq && sudo apt-get install -y -qq apache2-utils
-            htpasswd -Bbn -c docker-registry/auth/htpasswd registryuser "$(openssl rand -base64 24)"
+            htpasswd -Bb -c docker-registry/auth/htpasswd registryuser "$(openssl rand -base64 24)"
           fi
 
       - name: Build & push docker-registry
