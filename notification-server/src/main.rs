@@ -239,20 +239,36 @@ fn main() {
 
 async fn async_main() {
     use std::io::Write;
-    // Bind first so Fly sees the port quickly; then init tracing and router.
-    let _ = std::io::stderr().write_all(b"[ASYNC] Binding to 0.0.0.0:8000...\n");
+    let _ = std::io::stderr().write_all(b"[ASYNC] Entered async_main\n");
     let _ = std::io::stderr().flush();
 
-    let listener = match tokio::net::TcpListener::bind("0.0.0.0:8000").await {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = std::io::stderr()
-                .write_all(format!("[ASYNC] Failed to bind 0.0.0.0:8000: {}\n", e).as_bytes());
-            let _ = std::io::stderr().flush();
-            std::process::exit(1);
+    // Retry bind: on Fly/Firecracker the network may not be ready immediately.
+    const BIND_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+    const BIND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + BIND_RETRY;
+    let listener = loop {
+        match tokio::net::TcpListener::bind("0.0.0.0:8000").await {
+            Ok(l) => {
+                let _ = std::io::stderr().write_all(b"[ASYNC] Bound to 0.0.0.0:8000\n");
+                let _ = std::io::stderr().flush();
+                break l;
+            }
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = std::io::stderr()
+                        .write_all(format!("[ASYNC] Failed to bind after 30s: {}\n", e).as_bytes());
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(1);
+                }
+                let _ = std::io::stderr()
+                    .write_all(format!("[ASYNC] Bind failed, retrying: {}\n", e).as_bytes());
+                let _ = std::io::stderr().flush();
+                tokio::time::sleep(BIND_INTERVAL).await;
+            }
         }
     };
-    let _ = std::io::stderr().write_all(b"[ASYNC] Bound to 8000, initializing tracing...\n");
+
+    let _ = std::io::stderr().write_all(b"[ASYNC] Initializing tracing and router...\n");
     let _ = std::io::stderr().flush();
 
     tracing_subscriber::fmt()
