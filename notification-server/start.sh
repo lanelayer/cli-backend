@@ -43,6 +43,7 @@ dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --data-root
   docker buildx create --use --name builder 2>/dev/null || true
   if [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ] && [ -n "$DOCKER_REGISTRY" ]; then
     echo "Logging into Docker registry..."
+    # Use DOCKER_REGISTRY as-is (e.g. cli-backend-registry.internal:5000) so Docker uses insecure-registries and HTTP
     echo "$DOCKER_PASSWORD" | docker login "$DOCKER_REGISTRY" -u "$DOCKER_USERNAME" --password-stdin 2>&1 || true
   fi
 ) &
