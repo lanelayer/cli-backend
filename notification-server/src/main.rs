@@ -102,7 +102,10 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
                             warn!("⚠️ Lane export failed: {}", e);
 
                             let response = NotificationResponse {
-                                message: format!("✅ Lane build succeeded but export failed: {}", e),
+                                message: format!(
+                                    "✅ Lane build succeeded but export failed: {}",
+                                    e
+                                ),
                                 container: image_with_digest,
                                 status: "Partial Success".to_string(),
                                 timestamp,
@@ -157,7 +160,7 @@ async fn run_lane_build(
     info!("🚀 Starting Lane build with image: {}", image_with_digest);
 
     let mut child = TokioCommand::new("lane")
-        .args(&["build", "prod", "--image", image_with_digest])
+        .args(["build", "prod", "--image", image_with_digest])
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
@@ -192,7 +195,7 @@ fn main() {
     let _ = std::io::stderr().write_all(b"[INIT] Process starting...\n");
     let _ = std::io::stderr().write_all(format!("[INIT] PID: {}\n", std::process::id()).as_bytes());
     let _ = std::io::stderr().flush();
-    
+
     // Set panic hook early
     std::panic::set_hook(Box::new(|panic_info| {
         use std::io::Write;
@@ -201,14 +204,14 @@ fn main() {
         let _ = std::io::stderr().write_all(b"\n");
         let _ = std::io::stderr().flush();
     }));
-    
+
     let _ = std::io::stderr().write_all(b"[INIT] Panic hook set\n");
     let _ = std::io::stderr().flush();
-    
+
     // Run the async main
     let _ = std::io::stderr().write_all(b"[INIT] Starting tokio runtime...\n");
     let _ = std::io::stderr().flush();
-    
+
     tokio::runtime::Runtime::new()
         .expect("Failed to create tokio runtime")
         .block_on(async_main());
@@ -218,25 +221,25 @@ async fn async_main() {
     use std::io::Write;
     let _ = std::io::stderr().write_all(b"[ASYNC] Entered async_main\n");
     let _ = std::io::stderr().flush();
-    
+
     eprintln!("[DEBUG] Starting notification server...");
     eprintln!("[DEBUG] PID: {}", std::process::id());
-    
+
     let _ = std::io::stderr().write_all(b"[ASYNC] About to initialize tracing...\n");
     let _ = std::io::stderr().flush();
-    
+
     // Initialize tracing early to capture any errors
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
     let _ = std::io::stderr().write_all(b"[ASYNC] Tracing initialized\n");
     let _ = std::io::stderr().flush();
-    
+
     info!("🚀 Starting Rust notification server on port 8000");
     info!("📡 Webhook URL: http://localhost:8000/notify");
     info!("🏥 Health check: http://localhost:8000/health");
@@ -245,7 +248,7 @@ async fn async_main() {
 
     let _ = std::io::stderr().write_all(b"[ASYNC] Creating router...\n");
     let _ = std::io::stderr().flush();
-    
+
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/notify", post(notify_handler))
@@ -279,14 +282,14 @@ async fn async_main() {
 
     let _ = std::io::stderr().write_all(b"[ASYNC] Starting server...\n");
     let _ = std::io::stderr().flush();
-    
+
     info!("✅ Server listening on http://0.0.0.0:8000");
     info!("✅ Ready to accept connections");
 
     // Set up signal handling to catch termination signals
     let _ = std::io::stderr().write_all(b"[ASYNC] Setting up signal handlers...\n");
     let _ = std::io::stderr().flush();
-    
+
     let shutdown_signal = async {
         use tokio::signal;
         let ctrl_c = async {
@@ -294,7 +297,7 @@ async fn async_main() {
                 .await
                 .expect("failed to install Ctrl+C handler");
         };
-        
+
         #[cfg(unix)]
         let terminate = async {
             signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -302,10 +305,10 @@ async fn async_main() {
                 .recv()
                 .await;
         };
-        
+
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
-        
+
         tokio::select! {
             _ = ctrl_c => {
                 let _ = std::io::stderr().write_all(b"[SIGNAL] Received Ctrl+C\n");
@@ -323,7 +326,7 @@ async fn async_main() {
 
     // Handle serve errors gracefully
     let server = axum::serve(listener, app);
-    
+
     tokio::select! {
         result = server => {
             if let Err(e) = result {
@@ -349,7 +352,7 @@ async fn run_lane_export_and_upload(
     info!("📤 Starting Lane export");
 
     let mut child = TokioCommand::new("lane")
-        .args(&["export", "prod", "lane-export-temp"])
+        .args(["export", "prod", "lane-export-temp"])
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
