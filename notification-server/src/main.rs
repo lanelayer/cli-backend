@@ -239,16 +239,22 @@ fn main() {
 
 async fn async_main() {
     use std::io::Write;
-    let _ = std::io::stderr().write_all(b"[ASYNC] Entered async_main\n");
+    // Bind first so Fly sees the port quickly; then init tracing and router.
+    let _ = std::io::stderr().write_all(b"[ASYNC] Binding to 0.0.0.0:8000...\n");
     let _ = std::io::stderr().flush();
 
-    eprintln!("[DEBUG] Starting notification server...");
-    eprintln!("[DEBUG] PID: {}", std::process::id());
-
-    let _ = std::io::stderr().write_all(b"[ASYNC] About to initialize tracing...\n");
+    let listener = match tokio::net::TcpListener::bind("0.0.0.0:8000").await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = std::io::stderr()
+                .write_all(format!("[ASYNC] Failed to bind 0.0.0.0:8000: {}\n", e).as_bytes());
+            let _ = std::io::stderr().flush();
+            std::process::exit(1);
+        }
+    };
+    let _ = std::io::stderr().write_all(b"[ASYNC] Bound to 8000, initializing tracing...\n");
     let _ = std::io::stderr().flush();
 
-    // Initialize tracing early to capture any errors
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -257,17 +263,9 @@ async fn async_main() {
         )
         .init();
 
-    let _ = std::io::stderr().write_all(b"[ASYNC] Tracing initialized\n");
-    let _ = std::io::stderr().flush();
-
     info!("🚀 Starting Rust notification server on port 8000");
     info!("📡 Webhook URL: http://localhost:8000/notify");
     info!("🏥 Health check: http://localhost:8000/health");
-    info!("⏹️  Press Ctrl+C to stop the server");
-    info!("--------------------------------------------------");
-
-    let _ = std::io::stderr().write_all(b"[ASYNC] Creating router...\n");
-    let _ = std::io::stderr().flush();
 
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -275,40 +273,7 @@ async fn async_main() {
         .fallback(not_found_handler)
         .layer(middleware::from_fn(logging_middleware));
 
-    let _ = std::io::stderr().write_all(b"[ASYNC] Router created, binding to port 8000...\n");
-    let _ = std::io::stderr().flush();
-
-    // Handle binding errors gracefully
-    let listener = match tokio::net::TcpListener::bind("0.0.0.0:8000").await {
-        Ok(listener) => {
-            let _ = std::io::stderr().write_all(b"[ASYNC] Successfully bound to port 8000\n");
-            let _ = std::io::stderr().flush();
-            info!("✅ Successfully bound to 0.0.0.0:8000");
-            listener
-        }
-        Err(e) => {
-            let error_msg = format!("❌ Failed to bind to 0.0.0.0:8000: {}", e);
-            let _ = std::io::stderr().write_all(error_msg.as_bytes());
-            let _ = std::io::stderr().write_all(b"\n");
-            let _ = std::io::stderr().flush();
-            error!("{}", error_msg);
-            error!("   This could be due to:");
-            error!("   - Port 8000 is already in use");
-            error!("   - Insufficient permissions");
-            error!("   - Network configuration issue");
-            std::process::exit(1);
-        }
-    };
-
-    let _ = std::io::stderr().write_all(b"[ASYNC] Starting server...\n");
-    let _ = std::io::stderr().flush();
-
     info!("✅ Server listening on http://0.0.0.0:8000");
-    info!("✅ Ready to accept connections");
-
-    // Set up signal handling to catch termination signals
-    let _ = std::io::stderr().write_all(b"[ASYNC] Setting up signal handlers...\n");
-    let _ = std::io::stderr().flush();
 
     let shutdown_signal = async {
         use tokio::signal;
