@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use tokio::process::Command as TokioCommand;
+use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +158,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
 async fn run_lane_build(
     image_with_digest: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_docker().await?;
     info!("🚀 Starting Lane build with image: {}", image_with_digest);
 
     let mut child = TokioCommand::new("lane")
@@ -179,6 +181,27 @@ async fn run_lane_build(
 
 async fn not_found_handler(uri: Uri) -> impl IntoResponse {
     (StatusCode::NOT_FOUND, format!("Not found: {}", uri))
+}
+
+/// Wait for Docker daemon to be ready (e.g. after start.sh started it in background).
+/// Times out after 90 seconds.
+async fn wait_for_docker() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const MAX_WAIT: Duration = Duration::from_secs(90);
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + MAX_WAIT;
+
+    while tokio::time::Instant::now() < deadline {
+        let output = TokioCommand::new("docker")
+            .arg("info")
+            .output()
+            .await?;
+        if output.status.success() {
+            info!("Docker is ready");
+            return Ok(());
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+    Err("Docker did not become ready within 90 seconds".into())
 }
 
 async fn logging_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
