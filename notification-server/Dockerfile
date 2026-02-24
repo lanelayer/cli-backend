@@ -1,5 +1,5 @@
 # Use the official Rust image as a builder (matching Debian Bookworm for GLIBC compatibility)
-FROM rust:1-bookworm as builder
+FROM rust:1-bookworm AS builder
 WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
