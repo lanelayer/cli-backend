@@ -85,12 +85,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p docker-registry/auth
-          if [ -n "$REGISTRY_HTPASSWD" ]; then
-            echo "$REGISTRY_HTPASSWD" > docker-registry/auth/htpasswd
-          else
-            sudo apt-get update -qq && sudo apt-get install -y -qq apache2-utils
-            htpasswd -Bb -c docker-registry/auth/htpasswd registryuser "$(openssl rand -base64 24)"
+          if [ -z "$REGISTRY_HTPASSWD" ]; then
+            echo "::error::REGISTRY_HTPASSWD secret is not set. Add a generated htpasswd line (e.g. htpasswd -Bbn user password) in Settings → Secrets → Actions."
+            exit 1
           fi
+          echo "$REGISTRY_HTPASSWD" > docker-registry/auth/htpasswd
 
       - name: Build & push docker-registry
         uses: docker/build-push-action@v6
