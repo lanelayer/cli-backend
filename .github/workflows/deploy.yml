@@ -111,9 +111,8 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
-          # Use a PAT stored as GHCR_TOKEN (recommended). GITHUB_TOKEN can work too,
-          # but using a PAT avoids surprises when pulling from servers.
-          password: ${{ secrets.GHCR_TOKEN }}
+          # Use GHCR_TOKEN (PAT with write:packages) if set; otherwise GITHUB_TOKEN (works for same repo)
+          password: ${{ secrets.GHCR_TOKEN || github.token }}
 
       - name: Create registry auth htpasswd
         env:
