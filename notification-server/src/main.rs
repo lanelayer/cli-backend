@@ -191,10 +191,7 @@ async fn wait_for_docker() -> Result<(), Box<dyn std::error::Error + Send + Sync
     let deadline = tokio::time::Instant::now() + MAX_WAIT;
 
     while tokio::time::Instant::now() < deadline {
-        let output = TokioCommand::new("docker")
-            .arg("info")
-            .output()
-            .await?;
+        let output = TokioCommand::new("docker").arg("info").output().await?;
         if output.status.success() {
             info!("Docker is ready");
             return Ok(());
