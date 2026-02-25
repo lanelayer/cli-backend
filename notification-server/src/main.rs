@@ -364,13 +364,20 @@ async fn async_main() {
 
     tokio::select! {
         result = server => {
-            if let Err(e) = result {
-                let error_msg = format!("❌ Server error: {}", e);
-                let _ = std::io::stderr().write_all(error_msg.as_bytes());
-                let _ = std::io::stderr().write_all(b"\n");
-                let _ = std::io::stderr().flush();
-                error!("{}", error_msg);
-                std::process::exit(1);
+            match result {
+                Ok(()) => {
+                    let _ = std::io::stderr().write_all(b"[UNEXPECTED] Server exited without error - exiting with code 1 to trigger restart\n");
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    let error_msg = format!("❌ Server error: {}", e);
+                    let _ = std::io::stderr().write_all(error_msg.as_bytes());
+                    let _ = std::io::stderr().write_all(b"\n");
+                    let _ = std::io::stderr().flush();
+                    error!("{}", error_msg);
+                    std::process::exit(1);
+                }
             }
         },
         _ = shutdown_signal => {
