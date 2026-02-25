@@ -32,11 +32,6 @@ services:
     ports:
       - "${NOTIFICATION_PORT:-8000}:8000"
     environment:
-      # Docker registry credentials (for notification server to push/pull)
-      - DOCKER_USERNAME=${DOCKER_USERNAME:-}
-      - DOCKER_PASSWORD=${DOCKER_PASSWORD:-}
-      - DOCKER_REGISTRY=${DOCKER_REGISTRY:-http://docker-registry:5000}
-      
       # AWS/Tigris S3 credentials (for uploading exports)
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-${TIGRIS_ACCESS_KEY_ID:-}}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-${TIGRIS_SECRET_ACCESS_KEY:-}}
