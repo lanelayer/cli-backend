@@ -312,11 +312,14 @@ async fn async_main() {
                 loop {
                     sigterm.recv().await;
                     if start.elapsed() >= Duration::from_secs(SIGTERM_GRACE_SECS) {
-                        let _ = std::io::stderr().write_all(b"[SIGNAL] Received SIGTERM (after grace period), exiting\n");
+                        let _ = std::io::stderr().write_all(
+                            b"[SIGNAL] Received SIGTERM (after grace period), exiting\n",
+                        );
                         let _ = std::io::stderr().flush();
                         break;
                     }
-                    let _ = std::io::stderr().write_all(b"[SIGNAL] Ignoring SIGTERM (grace period)\n");
+                    let _ =
+                        std::io::stderr().write_all(b"[SIGNAL] Ignoring SIGTERM (grace period)\n");
                     let _ = std::io::stderr().flush();
                 }
             };
