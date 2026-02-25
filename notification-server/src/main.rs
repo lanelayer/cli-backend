@@ -209,9 +209,10 @@ async fn logging_middleware(req: Request<axum::body::Body>, next: Next) -> Respo
 }
 
 fn main() {
-    // CRITICAL: Write to stderr FIRST, before anything else
-    // Use raw write to avoid any buffering issues
+    // CRITICAL: Write to stderr FIRST, before anything else (visible in fly logs)
     use std::io::Write;
+    let _ = std::io::stderr().write_all(b"MAIN_STARTED\n");
+    let _ = std::io::stderr().flush();
     let _ = std::io::stderr().write_all(b"[INIT] Process starting...\n");
     let _ = std::io::stderr().write_all(format!("[INIT] PID: {}\n", std::process::id()).as_bytes());
     let _ = std::io::stderr().flush();
@@ -244,12 +245,13 @@ async fn async_main() {
 
     // Retry bind: on Fly/Firecracker the network may not be ready immediately.
     const BIND_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
-    const BIND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    const BIND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
     let deadline = std::time::Instant::now() + BIND_RETRY;
     let listener = loop {
         match tokio::net::TcpListener::bind("0.0.0.0:8000").await {
             Ok(l) => {
                 let _ = std::io::stderr().write_all(b"[ASYNC] Bound to 0.0.0.0:8000\n");
+                let _ = std::io::stderr().write_all(b"LISTENING_ON_8000\n");
                 let _ = std::io::stderr().flush();
                 break l;
             }
@@ -291,8 +293,11 @@ async fn async_main() {
 
     info!("✅ Server listening on http://0.0.0.0:8000");
 
+    const SIGTERM_GRACE_SECS: u64 = 60;
     let shutdown_signal = async {
+        use std::io::Write;
         use tokio::signal;
+        let start = std::time::Instant::now();
         let ctrl_c = async {
             signal::ctrl_c()
                 .await
@@ -300,29 +305,42 @@ async fn async_main() {
         };
 
         #[cfg(unix)]
-        let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("failed to install signal handler")
-                .recv()
-                .await;
+        let wait_for_shutdown = async {
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            let sigterm_loop = async {
+                loop {
+                    sigterm.recv().await;
+                    if start.elapsed() >= Duration::from_secs(SIGTERM_GRACE_SECS) {
+                        let _ = std::io::stderr().write_all(b"[SIGNAL] Received SIGTERM (after grace period), exiting\n");
+                        let _ = std::io::stderr().flush();
+                        break;
+                    }
+                    let _ = std::io::stderr().write_all(b"[SIGNAL] Ignoring SIGTERM (grace period)\n");
+                    let _ = std::io::stderr().flush();
+                }
+            };
+            tokio::select! {
+                _ = ctrl_c => {
+                    let _ = std::io::stderr().write_all(b"[SIGNAL] Received Ctrl+C\n");
+                    let _ = std::io::stderr().flush();
+                }
+                _ = sigterm_loop => {}
+            }
         };
 
         #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
+        let wait_for_shutdown = async {
+            ctrl_c.await;
+            let _ = std::io::stderr().write_all(b"[SIGNAL] Received Ctrl+C\n");
+            let _ = std::io::stderr().flush();
+        };
 
-        tokio::select! {
-            _ = ctrl_c => {
-                let _ = std::io::stderr().write_all(b"[SIGNAL] Received Ctrl+C\n");
-                let _ = std::io::stderr().flush();
-            },
-            _ = terminate => {
-                let _ = std::io::stderr().write_all(b"[SIGNAL] Received SIGTERM\n");
-                let _ = std::io::stderr().flush();
-            },
-        }
+        wait_for_shutdown.await
     };
 
     let _ = std::io::stderr().write_all(b"[ASYNC] Starting server with graceful shutdown...\n");
+    let _ = std::io::stderr().write_all(b"ACCEPTING_CONNECTIONS\n");
     let _ = std::io::stderr().flush();
 
     // Handle serve errors gracefully

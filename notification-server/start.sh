@@ -43,8 +43,15 @@ dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --data-root
   docker buildx create --use --name builder 2>/dev/null || true
   if [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ] && [ -n "$DOCKER_REGISTRY" ]; then
     echo "Logging into Docker registry..."
-    # Use DOCKER_REGISTRY as-is (e.g. cli-backend-registry.internal:5000) so Docker uses insecure-registries and HTTP
-    echo "$DOCKER_PASSWORD" | docker login "$DOCKER_REGISTRY" -u "$DOCKER_USERNAME" --password-stdin 2>&1 || true
+    # docker login expects host:port only; strip http:// or https:// to avoid 400 Bad Request
+    REGISTRY_HOST="${DOCKER_REGISTRY#http://}"
+    REGISTRY_HOST="${REGISTRY_HOST#https://}"
+    REGISTRY_HOST="${REGISTRY_HOST%%/*}"
+    if printf '%s' "$DOCKER_PASSWORD" | docker login "$REGISTRY_HOST" -u "$DOCKER_USERNAME" --password-stdin 2>&1; then
+      echo "Docker registry login succeeded"
+    else
+      echo "WARNING: Docker registry login failed (builds may still work if registry allows anonymous pull)" 1>&2
+    fi
   fi
 ) &
 
@@ -57,4 +64,9 @@ if [ ! -x /usr/local/bin/notification-server ]; then
   exit 1
 fi
 
-exec /usr/local/bin/notification-server
+# Run server in background so its stdout/stderr appear in Fly logs (no exec).
+# Shell stays as PID 1 and waits for the server; exit with server's exit code.
+/usr/local/bin/notification-server 2>&1 &
+SERVER_PID=$!
+wait $SERVER_PID
+exit $?
