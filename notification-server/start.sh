@@ -51,9 +51,6 @@ if [ ! -x /usr/local/bin/notification-server ]; then
   exit 1
 fi
 
-# Run server in background so its stdout/stderr appear in Fly logs (no exec).
-# Shell stays as PID 1 and waits for the server; exit with server's exit code.
-/usr/local/bin/notification-server 2>&1 &
-SERVER_PID=$!
-wait $SERVER_PID
-exit $?
+# Replace this process with the server so it becomes the main process.
+# Then Fly logs show the server's output and only the server receives signals.
+exec /usr/local/bin/notification-server
