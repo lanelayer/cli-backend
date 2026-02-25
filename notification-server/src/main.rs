@@ -294,48 +294,60 @@ async fn async_main() {
         .fallback(not_found_handler)
         .layer(middleware::from_fn(logging_middleware));
 
-    const SIGTERM_GRACE_SECS: u64 = 60;
+    const GRACE_SECS: u64 = 60;
     let shutdown_signal = async {
         use std::io::Write;
         use tokio::signal;
         let start = std::time::Instant::now();
-        let ctrl_c = async {
-            signal::ctrl_c()
-                .await
-                .expect("failed to install Ctrl+C handler");
-        };
 
         #[cfg(unix)]
         let wait_for_shutdown = async {
             let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
                 .expect("failed to install SIGTERM handler");
+            let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+                .expect("failed to install SIGINT handler");
+
+            let on_signal = |name: &str, in_grace: bool| {
+                let msg = if in_grace {
+                    format!("[SIGNAL] Ignoring {} (grace period)\n", name)
+                } else {
+                    format!("[SIGNAL] Received {} (after grace period), exiting\n", name)
+                };
+                let _ = std::io::stderr().write_all(msg.as_bytes());
+                let _ = std::io::stderr().flush();
+            };
+
             let sigterm_loop = async {
                 loop {
                     sigterm.recv().await;
-                    if start.elapsed() >= Duration::from_secs(SIGTERM_GRACE_SECS) {
-                        let _ = std::io::stderr().write_all(
-                            b"[SIGNAL] Received SIGTERM (after grace period), exiting\n",
-                        );
-                        let _ = std::io::stderr().flush();
+                    let in_grace = start.elapsed() < Duration::from_secs(GRACE_SECS);
+                    on_signal("SIGTERM", in_grace);
+                    if !in_grace {
                         break;
                     }
-                    let _ =
-                        std::io::stderr().write_all(b"[SIGNAL] Ignoring SIGTERM (grace period)\n");
-                    let _ = std::io::stderr().flush();
+                }
+            };
+            let sigint_loop = async {
+                loop {
+                    sigint.recv().await;
+                    let in_grace = start.elapsed() < Duration::from_secs(GRACE_SECS);
+                    on_signal("SIGINT", in_grace);
+                    if !in_grace {
+                        break;
+                    }
                 }
             };
             tokio::select! {
-                _ = ctrl_c => {
-                    let _ = std::io::stderr().write_all(b"[SIGNAL] Received Ctrl+C\n");
-                    let _ = std::io::stderr().flush();
-                }
                 _ = sigterm_loop => {}
+                _ = sigint_loop => {}
             }
         };
 
         #[cfg(not(unix))]
         let wait_for_shutdown = async {
-            ctrl_c.await;
+            signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
             let _ = std::io::stderr().write_all(b"[SIGNAL] Received Ctrl+C\n");
             let _ = std::io::stderr().flush();
         };
