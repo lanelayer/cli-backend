@@ -270,28 +270,29 @@ async fn async_main() {
         }
     };
 
-    let _ = std::io::stderr().write_all(b"[ASYNC] Initializing tracing and router...\n");
+    let _ = std::io::stderr().write_all(
+        b"[ASYNC] Building router and starting server (tracing init in background)...\n",
+    );
     let _ = std::io::stderr().flush();
 
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    info!("🚀 Starting Rust notification server on port 8000");
-    info!("📡 Webhook URL: http://localhost:8000/notify");
-    info!("🏥 Health check: http://localhost:8000/health");
+    // Init tracing in background so we don't delay the server from accepting /health.
+    // Fly's health check can hit very early; we must be ready as soon as possible.
+    tokio::spawn(async {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+        std::future::pending::<()>().await;
+    });
 
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/notify", post(notify_handler))
         .fallback(not_found_handler)
         .layer(middleware::from_fn(logging_middleware));
-
-    info!("✅ Server listening on http://0.0.0.0:8000");
 
     const SIGTERM_GRACE_SECS: u64 = 60;
     let shutdown_signal = async {

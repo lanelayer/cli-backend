@@ -2,6 +2,8 @@
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
+# Registry is public at https://<app>.fly.dev (HTTPS). Use this URL for DOCKER_REGISTRY
+
 
 app = 'cli-backend-registry'
 primary_region = 'cdg'
