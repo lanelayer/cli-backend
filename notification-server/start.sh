@@ -16,16 +16,15 @@ mkdir -p /root
 
 echo "Configuring Docker..."
 mkdir -p /etc/docker
+# No insecure-registries: we use the public HTTPS URL (cli-backend-registry.fly.dev)
 cat > /etc/docker/daemon.json <<EOF
-{
-  "insecure-registries": ["cli-backend-registry.internal:5000"]
-}
+{}
 EOF
 
-echo "Starting Docker daemon in background..."
-dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --data-root=/data/docker &
+echo "Starting Docker daemon in background (debug logging)..."
+dockerd --debug --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --data-root=/data/docker &
 
-# Background: wait for Docker, then set up buildx and registry login.
+# Background: wait for Docker, then set up buildx.
 # The notification server starts immediately below; handlers will wait for Docker when needed.
 (
   echo "Waiting for Docker to be ready..."
@@ -41,18 +40,6 @@ dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --data-root
   echo "Docker is ready (background)"
   echo "Setting up docker buildx..."
   docker buildx create --use --name builder 2>/dev/null || true
-  if [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ] && [ -n "$DOCKER_REGISTRY" ]; then
-    echo "Logging into Docker registry..."
-    # docker login expects host:port only; strip http:// or https:// to avoid 400 Bad Request
-    REGISTRY_HOST="${DOCKER_REGISTRY#http://}"
-    REGISTRY_HOST="${REGISTRY_HOST#https://}"
-    REGISTRY_HOST="${REGISTRY_HOST%%/*}"
-    if printf '%s' "$DOCKER_PASSWORD" | docker login "$REGISTRY_HOST" -u "$DOCKER_USERNAME" --password-stdin 2>&1; then
-      echo "Docker registry login succeeded"
-    else
-      echo "WARNING: Docker registry login failed (builds may still work if registry allows anonymous pull)" 1>&2
-    fi
-  fi
 ) &
 
 echo "Starting notification server (Docker will be ready in background)..."
