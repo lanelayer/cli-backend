@@ -24,7 +24,7 @@ primary_region = 'cdg'
     timeout = '5s'
     path = '/health'
 
-[restart]
+[[restart]]
   policy = 'on-failure'
   max_retries = 5
 
