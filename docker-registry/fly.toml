@@ -11,10 +11,6 @@ primary_region = 'cdg'
 [build]
   dockerfile = 'Dockerfile'
 
-[[mounts]]
-  source = 'registry_data'
-  destination = '/var/lib/registry'
-
 [http_service]
   internal_port = 5000
   force_https = true
@@ -23,24 +19,6 @@ primary_region = 'cdg'
   min_machines_running = 1
   processes = ['app']
 
-[[services]]
-  protocol = 'tcp'
-  internal_port = 5000
-  processes = ['app']
-
-  [[services.ports]]
-    port = 80
-    handlers = ['http']
-    force_https = true
-
-  [[services.ports]]
-    port = 443
-    handlers = ['tls', 'http']
-
-  [[services.tcp_checks]]
-    interval = '15s'
-    timeout = '5s'
-    grace_period = '60s'
 
 [[vm]]
   cpu_kind = 'shared'
