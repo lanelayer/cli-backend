@@ -150,22 +150,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute image prefix (lowercased for GHCR)
-        shell: bash
-        run: |
-          REPO_OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          REPO_NAME="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
-          echo "IMAGE_PREFIX=${REPO_OWNER}/${REPO_NAME}" >> "$GITHUB_ENV"
-
       - name: Setup Fly.io CLI
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Deploy Notification Server
         working-directory: ./notification-server
-        run: |
-          flyctl deploy \
-            --remote-only \
-            --image ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/notification-server:${{ github.sha }}
+        run: flyctl deploy --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
