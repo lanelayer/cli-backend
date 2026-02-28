@@ -42,27 +42,6 @@ dockerd --debug --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --d
   docker buildx create --use --name builder 2>/dev/null || true
   echo "Logging into registry..."
   echo "$REGISTRY_PASSWORD" | docker login cli-backend-registry.fly.dev -u lane-container --password-stdin || true
-
-  # Propagate docker credentials into lane build cache directories.
-  # lane-snapshot-builder runs with HOME=<cache-dir> and calls linuxkit, which
-  # looks for registry credentials at $HOME/.docker/config.json. Since that
-  # path is inside the per-build cache dir (not /root/.docker), we watch for
-  # new cache directories and copy the credentials there.
-  echo "Starting lane credential propagation daemon..."
-  (
-    while true; do
-      if [ -f /root/.docker/config.json ]; then
-        find /root/.cache/lane -mindepth 2 -maxdepth 2 -type d 2>/dev/null | while read -r cache_dir; do
-          if [ ! -f "$cache_dir/.docker/config.json" ]; then
-            mkdir -p "$cache_dir/.docker"
-            cp /root/.docker/config.json "$cache_dir/.docker/config.json"
-            echo "Seeded docker credentials -> $cache_dir/.docker/"
-          fi
-        done
-      fi
-      sleep 1
-    done
-  ) &
 ) &
 
 echo "Starting notification server (Docker will be ready in background)..."
