@@ -6,7 +6,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 RUN rm src/main.rs
 COPY src ./src
-RUN cargo build --release
+RUN touch src/main.rs && cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     curl \

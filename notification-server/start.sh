@@ -53,6 +53,11 @@ if [ ! -x /usr/local/bin/notification-server ]; then
   exit 1
 fi
 
+echo "=== Binary diagnostics ==="
+file /usr/local/bin/notification-server
+ls -lah /usr/local/bin/notification-server
+echo "=========================="
+
 # Replace this process with the server so it becomes the main process.
 # Then Fly logs show the server's output and only the server receives signals.
 exec /usr/local/bin/notification-server
