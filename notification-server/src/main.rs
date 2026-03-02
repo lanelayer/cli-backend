@@ -155,25 +155,134 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
     }
 }
 
+async fn log_disk_space(label: &str) {
+    match TokioCommand::new("df").args(["-h"]).output().await {
+        Ok(out) => info!(
+            "💾 Disk space ({}): {}",
+            label,
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        Err(e) => warn!("⚠️ Could not check disk space: {}", e),
+    }
+}
+
+async fn cleanup_docker() {
+    info!("🧹 Pruning stopped containers...");
+    match TokioCommand::new("docker")
+        .args(["container", "prune", "-f"])
+        .output()
+        .await
+    {
+        Ok(out) => info!(
+            "Container prune: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        Err(e) => warn!("Failed to prune containers: {}", e),
+    }
+
+    info!("🧹 Pruning dangling images...");
+    match TokioCommand::new("docker")
+        .args(["image", "prune", "-f"])
+        .output()
+        .await
+    {
+        Ok(out) => info!(
+            "Image prune: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        Err(e) => warn!("Failed to prune images: {}", e),
+    }
+
+    info!("🧹 Pruning build cache...");
+    match TokioCommand::new("docker")
+        .args(["builder", "prune", "-f"])
+        .output()
+        .await
+    {
+        Ok(out) => info!(
+            "Builder prune: {}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        Err(e) => warn!("Failed to prune build cache: {}", e),
+    }
+}
+
+async fn log_disk_space_detail(label: &str) {
+    for path in &["/", "/data", "/tmp"] {
+        match TokioCommand::new("df").args(["-h", path]).output().await {
+            Ok(out) => info!(
+                "💾 df {} ({}): {}",
+                path,
+                label,
+                String::from_utf8_lossy(&out.stdout).trim()
+            ),
+            Err(e) => warn!("⚠️ df {} failed: {}", path, e),
+        }
+    }
+}
+
 async fn run_lane_build(
     image_with_digest: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncReadExt;
+
     wait_for_docker().await?;
+    log_disk_space("before cleanup").await;
+    cleanup_docker().await;
+    log_disk_space_detail("after cleanup / before lane build").await;
     info!("🚀 Starting Lane build with image: {}", image_with_digest);
 
     let mut child = TokioCommand::new("lane")
         .args(["build", "prod", "--image", image_with_digest])
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .current_dir("/root")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
 
+    let mut stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+    let mut stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+    let (stdout_tx, stdout_rx) = tokio::sync::oneshot::channel();
+    let (stderr_tx, stderr_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out).await;
+        let _ = stdout_tx.send(out);
+    });
+    tokio::spawn(async move {
+        let mut err = Vec::new();
+        let _ = stderr.read_to_end(&mut err).await;
+        let _ = stderr_tx.send(err);
+    });
+
     let status = child.wait().await?;
+
+    let stdout_bytes = stdout_rx.await.unwrap_or_default();
+    let stderr_bytes = stderr_rx.await.unwrap_or_default();
+    let stdout_str = String::from_utf8_lossy(&stdout_bytes);
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+
+    log_disk_space("after lane build").await;
 
     if status.success() {
         info!("✅ Lane build completed successfully");
         Ok("Lane build completed successfully".to_string())
     } else {
-        let error_msg = format!("Lane build failed with exit code {}", status);
+        let error_msg = format!(
+            "Lane build failed with exit code {}.\nstdout: {}\nstderr: {}",
+            status,
+            if stdout_str.is_empty() {
+                "(empty)"
+            } else {
+                stdout_str.trim()
+            },
+            if stderr_str.is_empty() {
+                "(empty)"
+            } else {
+                stderr_str.trim()
+            }
+        );
         error!("❌ {}", error_msg);
         Err(error_msg.into())
     }
@@ -388,13 +497,30 @@ async fn async_main() {
     }
 }
 
+/// Export output directory. Must be absolute when using current_dir("/root") so upload can find it.
+const LANE_EXPORT_DIR: &str = "/root/lane-export-temp";
+
 async fn run_lane_export_and_upload(
     digest: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("📤 Starting Lane export");
 
+    // Clean up any previous export directory so we start fresh.
+    if tokio::fs::metadata(LANE_EXPORT_DIR).await.is_ok() {
+        info!("🧹 Removing previous {}...", LANE_EXPORT_DIR);
+        tokio::fs::remove_dir_all(LANE_EXPORT_DIR).await.ok();
+    }
+
+    // Export looks for ~/.cache/lane (build wrote to XDG_CACHE_HOME). Use LANE_HOME so ~/.cache points to same cache.
+    // Run from /root so cache key matches build (same project context).
+    let lane_home = std::env::var("LANE_HOME").unwrap_or_else(|_| "/data/lane-home".to_string());
+    let lane_cache =
+        std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| "/data/lane-cache".to_string());
     let mut child = TokioCommand::new("lane")
-        .args(["export", "prod", "lane-export-temp"])
+        .args(["export", "prod", LANE_EXPORT_DIR])
+        .current_dir("/root")
+        .env("HOME", &lane_home)
+        .env("XDG_CACHE_HOME", &lane_cache)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
@@ -408,12 +534,18 @@ async fn run_lane_export_and_upload(
     info!("✅ Lane export completed successfully");
     info!("☁️ Starting upload to Tigris S3");
 
-    upload_to_tigris(digest).await?;
+    upload_to_tigris(digest, LANE_EXPORT_DIR).await?;
+
+    info!("🧹 Cleaning up {} after upload...", LANE_EXPORT_DIR);
+    tokio::fs::remove_dir_all(LANE_EXPORT_DIR).await.ok();
 
     Ok(())
 }
 
-async fn upload_to_tigris(digest: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn upload_to_tigris(
+    digest: &str,
+    export_dir: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use s3::creds::Credentials;
     use s3::{Bucket, Region};
     use std::path::Path;
@@ -437,11 +569,10 @@ async fn upload_to_tigris(digest: &str) -> Result<(), Box<dyn std::error::Error 
     };
 
     let bucket = Bucket::new("lane-exports", region, credentials)?;
-    let export_dir = "lane-export-temp";
 
     let export_path = Path::new(export_dir);
     if !export_path.exists() {
-        return Err("Export directory 'lane-export-temp' does not exist".into());
+        return Err(format!("Export directory '{}' does not exist", export_dir).into());
     }
 
     let mut uploaded_count = 0;

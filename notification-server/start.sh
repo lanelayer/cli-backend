@@ -9,10 +9,36 @@ echo 1 > /proc/sys/vm/overcommit_memory
 
 echo "Setting up volumes..."
 mkdir -p /data/docker /data/root
+# Mount Tigris bucket for Lane cache and build working dir (uses existing AWS_* / TIGRIS_* creds)
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-$TIGRIS_ACCESS_KEY_ID}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-$TIGRIS_ACCESS_KEY_SECRET}"
+if [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ]; then
+  BUCKET="${TIGRIS_BUCKET_NAME:-lane-exports}"
+  echo "Mounting Tigris bucket ${BUCKET} at /data/root..."
+  tigrisfs "${BUCKET}" /data/root &
+  sleep 3
+  if mountpoint -q /data/root 2>/dev/null; then
+    echo "TigrisFS mounted successfully"
+  else
+    echo "WARN: TigrisFS mount failed, using local /data/root (disk may be tight)"
+  fi
+else
+  echo "WARN: No Tigris creds (AWS_ACCESS_KEY_ID or TIGRIS_ACCESS_KEY_ID) - using local /data/root"
+fi
 rm -rf /root
 ln -s /data/root /root
 export HOME=/root
 mkdir -p /root
+
+# Lane cache on local disk (avoids I/O errors when Cartesi reads snapshot from Tigris FUSE)
+LANE_CACHE_DIR="/data/lane-cache"
+mkdir -p "$LANE_CACHE_DIR"
+export XDG_CACHE_HOME="$LANE_CACHE_DIR"
+# Lane export looks for ~/.cache/lane; use a HOME whose .cache points to the same local cache
+export LANE_HOME="/data/lane-home"
+mkdir -p "$LANE_HOME"
+ln -sfn "$LANE_CACHE_DIR" "$LANE_HOME/.cache"
+echo "Lane cache directory (local disk): $LANE_CACHE_DIR (export uses LANE_HOME=$LANE_HOME)"
 
 echo "Configuring Docker..."
 mkdir -p /etc/docker
@@ -40,6 +66,9 @@ dockerd --debug --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --d
   echo "Docker is ready (background)"
   echo "Setting up docker buildx..."
   docker buildx create --use --name builder 2>/dev/null || true
+  echo "Pre-pulling Lane build images..."
+  docker pull ghcr.io/lanelayer/lane-snapshot-builder@sha256:5de1cfaea1a33c8cdcee1abd3306ae9a25709a2522fa33c95822a4fc209b7a18 2>/dev/null || true
+  docker pull tonistiigi/binfmt:latest 2>/dev/null || true
   echo "Logging into registry..."
   echo "$REGISTRY_PASSWORD" | docker login cli-backend-registry.fly.dev -u lane-container --password-stdin || true
 ) &

@@ -12,10 +12,17 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     docker.io \
+    pigz \
     strace \
     file \
     libc6 \
-    && rm -rf /var/lib/apt/lists/*
+    fuse3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sSL -o /tmp/tigrisfs.deb https://github.com/tigrisdata/tigrisfs/releases/download/v1.2.1/tigrisfs_1.2.1_linux_amd64.deb \
+    && dpkg-deb -x /tmp/tigrisfs.deb /tmp/tigrisfs-extract \
+    && cp /tmp/tigrisfs-extract/usr/bin/tigrisfs /usr/local/bin/tigrisfs \
+    && chmod +x /usr/local/bin/tigrisfs \
+    && rm -rf /tmp/tigrisfs.deb /tmp/tigrisfs-extract
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && npm install -g @lanelayer/cli
