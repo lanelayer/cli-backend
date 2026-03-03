@@ -50,8 +50,8 @@ EOF
 echo "Starting Docker daemon in background (debug logging)..."
 dockerd --debug --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --data-root=/data/docker &
 
-# Background: wait for Docker, then set up buildx.
-# The notification server starts immediately below; handlers will wait for Docker when needed.
+# Background: wait for Docker, then set up buildx and login.
+# Server starts immediately so it can pass Fly health checks; handlers wait for Docker/registry when needed.
 (
   echo "Waiting for Docker to be ready..."
   timeout=90
@@ -64,16 +64,30 @@ dockerd --debug --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --d
     sleep 1
   done
   echo "Docker is ready (background)"
+
+  echo "Logging into registry (must complete before lane build can pull image)..."
+  if echo "$REGISTRY_PASSWORD" | docker login cli-backend-registry.fly.dev -u lane-container --password-stdin 2>&1; then
+    echo "REGISTRY_LOGIN_SUCCEEDED"
+    # Lane runs with HOME=/data/lane-home and looks for credentials at $HOME/.docker/config.json.
+    # Docker login wrote to /root/.docker/config.json (/root -> /data/root symlink).
+    # Link the config so Lane (and LinuxKit inside its container) can authenticate.
+    mkdir -p /data/lane-home/.docker
+    ln -sfn /root/.docker/config.json /data/lane-home/.docker/config.json
+    echo "Linked docker credentials to /data/lane-home/.docker/config.json"
+    touch /tmp/registry-login-done 2>/dev/null || true
+  else
+    echo "REGISTRY_LOGIN_FAILED (lane build may fail to pull container)"
+  fi
+
   echo "Setting up docker buildx..."
   docker buildx create --use --name builder 2>/dev/null || true
+
   echo "Pre-pulling Lane build images..."
   docker pull ghcr.io/lanelayer/lane-snapshot-builder@sha256:5de1cfaea1a33c8cdcee1abd3306ae9a25709a2522fa33c95822a4fc209b7a18 2>/dev/null || true
   docker pull tonistiigi/binfmt:latest 2>/dev/null || true
-  echo "Logging into registry..."
-  echo "$REGISTRY_PASSWORD" | docker login cli-backend-registry.fly.dev -u lane-container --password-stdin || true
 ) &
 
-echo "Starting notification server (Docker will be ready in background)..."
+echo "Starting notification server (Docker/buildx will be ready in background)..."
 export RUST_BACKTRACE=1
 export RUST_LOG=info
 

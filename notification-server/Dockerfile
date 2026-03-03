@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     docker.io \
     pigz \
+    procps \
     strace \
     file \
     libc6 \
