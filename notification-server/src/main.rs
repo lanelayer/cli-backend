@@ -86,16 +86,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
                     info!("✅ Lane build completed successfully");
                     info!("Output: {}", output);
 
-                    // Build writes to .../lane/HASH1/HASH2/vc-cm-snapshot-release.squashfs;
-                    // export looks for .../lane/HASH1/vc-cm-snapshot-release.squashfs. Create symlink.
-                    if let Err(e) = link_squashfs_for_export().await {
-                        warn!(
-                            "⚠️ Could not link squashfs for export (export may fail): {}",
-                            e
-                        );
-                    }
-
-                    match run_lane_export_and_upload(&digest).await {
+                    match run_lane_export_and_upload(&digest, &image_with_digest).await {
                         Ok(_) => {
                             info!("✅ Lane export completed successfully");
 
@@ -533,100 +524,9 @@ async fn async_main() {
 
 /// Export output directory. Must be absolute when using current_dir("/root") so upload can find it.
 const LANE_EXPORT_DIR: &str = "/root/lane-export-temp";
-
-const SQUASHFS_NAME: &str = "vc-cm-snapshot-release.squashfs";
-
-/// Build may write to XDG_CACHE_HOME/HASH1/HASH2/ or XDG_CACHE_HOME/lane/HASH1/HASH2/.
-/// Export looks for .../lane/HASH1/vc-cm-snapshot-release.squashfs. Find the file and create the symlink.
-/// Also search /data/root/.cache in case lane used cwd-based cache.
-async fn link_squashfs_for_export() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::os::unix::fs::symlink;
-    use walkdir::WalkDir;
-
-    let cache_root = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| "/data/lane-cache".into());
-    // Build uses ~/.cache (HOME=/root) = /data/root/.cache when env not passed; also check XDG_CACHE_HOME.
-    let roots_to_search: Vec<std::path::PathBuf> = vec![
-        std::path::PathBuf::from("/data/root/.cache"),
-        std::path::PathBuf::from(&cache_root),
-    ];
-
-    // Link always goes in cache_root/lane/HASH1/ so export (via ~/.cache -> XDG_CACHE_HOME) finds it.
-    let (link_path, target_path) = tokio::task::spawn_blocking({
-        let cache_root = std::path::PathBuf::from(&cache_root);
-        let roots = roots_to_search.clone();
-        move || {
-            for search_root in &roots {
-                if !search_root.is_dir() {
-                    continue;
-                }
-                for entry in WalkDir::new(search_root)
-                    .min_depth(2)
-                    .max_depth(10)
-                    .follow_links(false)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
-                    if entry.file_name() == SQUASHFS_NAME {
-                        let path = entry.path().to_path_buf();
-                        let parent = path.parent().ok_or("no parent")?;
-                        let _hash2 = parent
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .ok_or("parent not utf8")?;
-                        let grandparent = parent.parent().ok_or("no grandparent")?;
-                        let hash1 = grandparent
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .ok_or("grandparent not utf8")?;
-                        // Export expects cache_root/lane/HASH1/squashfs. Create link there.
-                        let lane_dir = cache_root.join("lane").join(hash1);
-                        let link_path = lane_dir.join(SQUASHFS_NAME);
-                        // Use absolute path for symlink target so it works regardless of where we found the file
-                        let target_path = path.canonicalize().unwrap_or(path);
-                        return Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                            link_path,
-                            target_path,
-                        ));
-                    }
-                }
-            }
-            // Log cache contents to help debug when file is not found
-            let mut samples = Vec::new();
-            for r in &roots {
-                if r.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(r) {
-                        for e in entries.take(20).flatten() {
-                            samples.push(format!("  {:?}", e.path()));
-                        }
-                    }
-                }
-            }
-            let hint = format!(
-                "vc-cm-snapshot-release.squashfs not found under cache. Searched: {:?}. Sample entries: {:?}",
-                roots, samples
-            );
-            Err(hint.into())
-        }
-    })
-    .await??;
-
-    tokio::fs::create_dir_all(link_path.parent().unwrap()).await?;
-    if link_path.exists() {
-        tokio::fs::remove_file(&link_path).await.ok();
-    }
-    let target_path_clone = target_path.clone();
-    let link_path_clone = link_path.clone();
-    tokio::task::spawn_blocking(move || symlink(&target_path_clone, link_path_clone)).await??;
-    info!(
-        "✅ Linked {} -> {} for export",
-        link_path.display(),
-        target_path.display()
-    );
-    Ok(())
-}
-
 async fn run_lane_export_and_upload(
     digest: &str,
+    image: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("📤 Starting Lane export");
 
@@ -636,13 +536,11 @@ async fn run_lane_export_and_upload(
         tokio::fs::remove_dir_all(LANE_EXPORT_DIR).await.ok();
     }
 
-    // Export looks for ~/.cache/lane (build wrote to XDG_CACHE_HOME). Use LANE_HOME so ~/.cache points to same cache.
-    // Run from /root so cache key matches build (same project context).
     let lane_home = std::env::var("LANE_HOME").unwrap_or_else(|_| "/data/lane-home".to_string());
     let lane_cache =
         std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| "/data/lane-cache".to_string());
     let mut child = TokioCommand::new("lane")
-        .args(["export", "prod", LANE_EXPORT_DIR])
+        .args(["export", "prod", LANE_EXPORT_DIR, "--image", image])
         .current_dir("/root")
         .env("HOME", &lane_home)
         .env("XDG_CACHE_HOME", &lane_cache)

@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /tmp/tigrisfs.deb /tmp/tigrisfs-extract
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
-    && npm install -g @lanelayer/cli
+    && npm install -g @lanelayer/cli@0.4.12
 
 RUN mkdir -p /usr/local/lib/docker/cli-plugins/ && \
     curl -SL https://github.com/docker/buildx/releases/download/v0.12.1/buildx-v0.12.1.linux-amd64 -o /usr/local/lib/docker/cli-plugins/docker-buildx && \

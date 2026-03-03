@@ -9,24 +9,6 @@ echo 1 > /proc/sys/vm/overcommit_memory
 
 echo "Setting up volumes..."
 mkdir -p /data/docker /data/root
-# Mount Tigris bucket for Lane cache and build working dir (uses existing AWS_* / TIGRIS_* creds)
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-$TIGRIS_ACCESS_KEY_ID}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-$TIGRIS_ACCESS_KEY_SECRET}"
-if [ -n "${AWS_ACCESS_KEY_ID}" ] && [ -n "${AWS_SECRET_ACCESS_KEY}" ]; then
-  BUCKET="${TIGRIS_BUCKET_NAME:-lane-exports}"
-  echo "Mounting Tigris bucket ${BUCKET} at /data/root..."
-  tigrisfs "${BUCKET}" /data/root &
-  sleep 3
-  if mountpoint -q /data/root 2>/dev/null; then
-    echo "TigrisFS mounted successfully"
-  else
-    echo "WARN: TigrisFS mount failed, using local /data/root (disk may be tight)"
-  fi
-else
-  echo "WARN: No Tigris creds (AWS_ACCESS_KEY_ID or TIGRIS_ACCESS_KEY_ID) - using local /data/root"
-fi
-rm -rf /root
-ln -s /data/root /root
 export HOME=/root
 mkdir -p /root
 
@@ -47,12 +29,16 @@ cat > /etc/docker/daemon.json <<EOF
 {}
 EOF
 
+rm -rf /root/.docker
+mkdir -p /data/lane-home/.docker
+ln -s /data/lane-home/.docker /root/.docker
+
 echo "Starting Docker daemon in background (debug logging)..."
 dockerd --debug --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --data-root=/data/docker &
 
 # Background: wait for Docker, then set up buildx and login.
 # Server starts immediately so it can pass Fly health checks; handlers wait for Docker/registry when needed.
-(
+
   echo "Waiting for Docker to be ready..."
   timeout=90
   while ! docker info >/dev/null 2>&1; do
@@ -68,24 +54,22 @@ dockerd --debug --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2376 --d
   echo "Logging into registry (must complete before lane build can pull image)..."
   if echo "$REGISTRY_PASSWORD" | docker login cli-backend-registry.fly.dev -u lane-container --password-stdin 2>&1; then
     echo "REGISTRY_LOGIN_SUCCEEDED"
-    # Lane runs with HOME=/data/lane-home and looks for credentials at $HOME/.docker/config.json.
-    # Docker login wrote to /root/.docker/config.json (/root -> /data/root symlink).
-    # Link the config so Lane (and LinuxKit inside its container) can authenticate.
-    mkdir -p /data/lane-home/.docker
-    ln -sfn /root/.docker/config.json /data/lane-home/.docker/config.json
-    echo "Linked docker credentials to /data/lane-home/.docker/config.json"
     touch /tmp/registry-login-done 2>/dev/null || true
   else
     echo "REGISTRY_LOGIN_FAILED (lane build may fail to pull container)"
   fi
 
   echo "Setting up docker buildx..."
-  docker buildx create --use --name builder 2>/dev/null || true
+  docker buildx rm oci-builder 2>/dev/null || true
+  docker buildx create \
+    --name oci-builder \
+    --driver docker-container \
+    --use
 
   echo "Pre-pulling Lane build images..."
   docker pull ghcr.io/lanelayer/lane-snapshot-builder@sha256:5de1cfaea1a33c8cdcee1abd3306ae9a25709a2522fa33c95822a4fc209b7a18 2>/dev/null || true
   docker pull tonistiigi/binfmt:latest 2>/dev/null || true
-) &
+
 
 echo "Starting notification server (Docker/buildx will be ready in background)..."
 export RUST_BACKTRACE=1
