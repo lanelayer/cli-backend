@@ -1,3 +1,6 @@
+mod sprite;
+mod tigris;
+
 use axum::{
     extract::Json,
     http::{Request, StatusCode, Uri},
@@ -39,6 +42,8 @@ struct NotificationResponse {
     container: String,
     status: String,
     timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lane_rpc_url: Option<String>,
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -90,11 +95,29 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
                         Ok(_) => {
                             info!("✅ Lane export completed successfully");
 
+                            let lane_rpc_url = match sprite::deploy_sprite(&digest).await {
+                                Ok(result) => {
+                                    info!(
+                                        "✅ Sprite deployed: {} at {}",
+                                        result.sprite_name, result.rpc_url
+                                    );
+                                    Some(result.rpc_url)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "⚠️ Sprite deploy failed (build/export succeeded): {}",
+                                        e
+                                    );
+                                    None
+                                }
+                            };
+
                             let response = NotificationResponse {
                                 message: "✅ Notification processed, Lane build and export completed successfully!".to_string(),
                                 container: image_with_digest,
                                 status: "Success".to_string(),
                                 timestamp,
+                                lane_rpc_url,
                             };
 
                             (StatusCode::OK, Json(response))
@@ -110,6 +133,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
                                 container: image_with_digest,
                                 status: "Partial Success".to_string(),
                                 timestamp,
+                                lane_rpc_url: None,
                             };
 
                             (StatusCode::OK, Json(response))
@@ -124,6 +148,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
                         container: image_with_digest,
                         status: "Failed".to_string(),
                         timestamp,
+                        lane_rpc_url: None,
                     };
 
                     (StatusCode::INTERNAL_SERVER_ERROR, Json(response))
@@ -137,6 +162,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
                 container: notification.registry_path,
                 status: "Warning".to_string(),
                 timestamp,
+                lane_rpc_url: None,
             };
 
             (StatusCode::OK, Json(response))
@@ -149,6 +175,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
             container: notification.registry_path,
             status: "Failed".to_string(),
             timestamp,
+            lane_rpc_url: None,
         };
 
         (StatusCode::OK, Json(response))
@@ -557,131 +584,10 @@ async fn run_lane_export_and_upload(
     info!("✅ Lane export completed successfully");
     info!("☁️ Starting upload to Tigris S3");
 
-    upload_to_tigris(digest, LANE_EXPORT_DIR).await?;
+    tigris::upload_to_tigris(digest, LANE_EXPORT_DIR).await?;
 
     info!("🧹 Cleaning up {} after upload...", LANE_EXPORT_DIR);
     tokio::fs::remove_dir_all(LANE_EXPORT_DIR).await.ok();
 
     Ok(())
-}
-
-async fn upload_to_tigris(
-    digest: &str,
-    export_dir: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use s3::creds::Credentials;
-    use s3::{Bucket, Region};
-    use std::path::Path;
-    use walkdir::WalkDir;
-
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-        .or_else(|_| std::env::var("TIGRIS_ACCESS_KEY_ID"))
-        .map_err(|_| "AWS_ACCESS_KEY_ID or TIGRIS_ACCESS_KEY_ID environment variable not set")?;
-
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .or_else(|_| std::env::var("TIGRIS_SECRET_ACCESS_KEY"))
-        .map_err(|_| {
-            "AWS_SECRET_ACCESS_KEY or TIGRIS_SECRET_ACCESS_KEY environment variable not set"
-        })?;
-
-    let credentials = Credentials::new(Some(&access_key), Some(&secret_key), None, None, None)?;
-
-    let region = Region::Custom {
-        region: "ap-northeast-2".to_string(),
-        endpoint: "https://t3.storage.dev".to_string(),
-    };
-
-    let bucket = Bucket::new("lane-exports", region, credentials)?;
-
-    let export_path = Path::new(export_dir);
-    if !export_path.exists() {
-        return Err(format!("Export directory '{}' does not exist", export_dir).into());
-    }
-
-    let mut uploaded_count = 0;
-    let mut error_count = 0;
-
-    for entry in WalkDir::new(export_path)
-        .min_depth(1)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-
-        if path.is_file() {
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or("Invalid filename")?;
-
-            let s3_key = format!("{}/{}", digest, filename);
-
-            info!("Uploading {} to s3://lane-exports/{}", filename, s3_key);
-
-            match upload_file(&bucket, path, &s3_key).await {
-                Ok(_) => {
-                    info!("Successfully uploaded {}", filename);
-                    uploaded_count += 1;
-                }
-                Err(e) => {
-                    warn!("Failed to upload {}: {}", filename, e);
-                    error_count += 1;
-                }
-            }
-        }
-    }
-
-    info!(
-        "Upload complete! Successfully uploaded: {} files to s3://lane-exports/{}",
-        uploaded_count, digest
-    );
-    if error_count > 0 {
-        warn!("Failed to upload: {} files", error_count);
-    }
-
-    Ok(())
-}
-
-async fn upload_file(
-    bucket: &s3::Bucket,
-    file_path: &std::path::Path,
-    s3_key: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let metadata = tokio::fs::metadata(file_path)
-        .await
-        .map_err(|e| format!("Failed to get metadata for file: {:?}: {}", file_path, e))?;
-    let file_size = metadata.len();
-
-    info!(
-        "Uploading file: {} (size: {} bytes)",
-        file_path.display(),
-        file_size
-    );
-
-    if file_size > 5 * 1024 * 1024 {
-        info!(
-            "Using multipart upload for large file: {}",
-            file_path.display()
-        );
-    }
-
-    let content = tokio::fs::read(file_path)
-        .await
-        .map_err(|e| format!("Failed to read file: {:?}: {}", file_path, e))?;
-
-    let response = bucket.put_object(s3_key, &content).await.map_err(|e| {
-        format!(
-            "Failed to upload to s3://{}/{}: {}",
-            bucket.name(),
-            s3_key,
-            e
-        )
-    })?;
-
-    if response.status_code() == 200 {
-        Ok(())
-    } else {
-        Err(format!("Upload failed with status code: {}", response.status_code()).into())
-    }
 }
