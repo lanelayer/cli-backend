@@ -111,11 +111,15 @@ fn build_lane_compose() -> String {
         warn!("DERIVED_DA_ADDRESS not set; derive-node will fail at container start (set in Fly secrets)");
     }
     let start_block = std::env::var("START_BLOCK").unwrap_or_else(|_| "0".to_string());
+    // Backwards-compat: ON_DEMAND_POLLING=true means "on-demand polling mode" for derive-node.
+    // Core-lane entrypoint now drives this via DERIVED_NO_POLL.
+    let on_demand_polling =
+        std::env::var("ON_DEMAND_POLLING").unwrap_or_else(|_| "true".to_string());
 
     format!(
         r#"services:
   lane-node:
-    image: ghcr.io/lanelayer/core-lane/core-lane:latest
+    image: ghcr.io/lanelayer/core-lane/core-lane@sha256:ec26551c7cc42d70b7aaf08706613d6c3397462bd4fa65034222b3b5d5bc36b5
     volumes:
       - /data:/data
     ports:
@@ -129,8 +133,9 @@ fn build_lane_compose() -> String {
       HTTP_PORT: "8545"
       ONLY_START: "derive-node"
       START_BLOCK: "{}"
+      DERIVED_NO_POLL: "{}"
 "#,
-        chain_id, core_rpc_url, derived_da_address, start_block
+        chain_id, core_rpc_url, derived_da_address, start_block, on_demand_polling
     )
 }
 
@@ -150,7 +155,8 @@ fn lane_service_request(http_port: u16) -> ServiceRequest {
         };
     }
 
-    // Docker Compose pattern: install Docker, write compose, run core-lane (lane-espresso style)
+    // Docker Compose pattern: install Docker, write compose, optionally host-mount snapshot, run core-lane.
+    // Core-lane entrypoint will detect an existing ${DATA_DIR}/vc-cm-snapshot (with config.json) and reuse it.
     let service_script = format!(
         r#"set -e
 mkdir -p /srv
@@ -173,6 +179,14 @@ fi
 if [ ! -S /var/run/docker.sock ]; then
   sudo dockerd &
   until [ -S /var/run/docker.sock ] 2>/dev/null; do sleep 1; done
+fi
+if [ -f /data/vc-cm-snapshot.squashfs ]; then
+  mkdir -p /data/vc-cm-snapshot
+  if ! mount | grep -q " /data/vc-cm-snapshot "; then
+    if ! sudo mount -t squashfs -o loop /data/vc-cm-snapshot.squashfs /data/vc-cm-snapshot; then
+      echo "Warning: failed to host-mount vc-cm-snapshot.squashfs; entrypoint will fall back to unsquashfs" >&2
+    fi
+  fi
 fi
 exec sudo docker compose -f /srv/docker-compose.yml up
 "#,
