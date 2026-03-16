@@ -20,8 +20,10 @@ use tracing::{error, info, warn};
 struct LaneNotification {
     #[serde(rename = "type")]
     notification_type: String,
-    registry_path: String,
+    /// Image reference where lane CLI originally pushed the image (e.g. ttl.sh/...)
     original_path: String,
+    /// Image reference in our own registry where we expect to build from
+    registry_path: String,
     timestamp: DateTime<Utc>,
     success: bool,
     profile: String,
@@ -62,8 +64,8 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
 
     info!("📢 Lane Notification Received:");
     info!("   Type: {}", notification.notification_type);
-    info!("   Registry Path: {}", notification.registry_path);
     info!("   Original Path: {}", notification.original_path);
+    info!("   Registry Path: {}", notification.registry_path);
     info!("   Success: {}", notification.success);
     info!("   Profile: {}", notification.profile);
     info!("   Platforms: {:?}", notification.platforms);
@@ -73,29 +75,73 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
     }
 
     if notification.success {
-        if let Some(digest) = notification.digest {
-            let image_with_digest = format!(
+        if let Some(digest) = notification.digest.as_deref() {
+            // Require a sha256 digest so we can derive a short ID for the registry image name.
+            if !digest.starts_with("sha256:") {
+                warn!("No valid sha256 digest in notification (got {})", digest);
+                let response = NotificationResponse {
+                    message: "⚠️ Invalid digest format in notification (expected sha256:...)"
+                        .to_string(),
+                    container: notification.original_path.clone(),
+                    status: "Warning".to_string(),
+                    timestamp,
+                    lane_rpc_url: None,
+                };
+                return (StatusCode::OK, Json(response));
+            }
+
+            // 1) Get the first 8 characters after "sha256:" (used to name our registry image).
+            let short = &digest["sha256:".len()..];
+            let short8: String = short.chars().take(8).collect();
+
+            // 2) Source image (where lane CLI pushed the image, e.g. ttl.sh/...)
+            let source_image_with_digest = format!(
                 "{}@{}",
                 notification
-                    .registry_path
+                    .original_path
                     .split(':')
                     .next()
-                    .unwrap_or(&notification.registry_path),
+                    .unwrap_or(&notification.original_path),
                 digest
             );
 
-            info!("🔧 Building with digest-based image: {}", image_with_digest);
+            // 3) Target image in our own registry, derived from digest: cli-backend-registry.fly.dev/lane-<short8>:latest
+            let registry_base = std::env::var("LANE_REGISTRY_BASE")
+                .unwrap_or_else(|_| "cli-backend-registry.fly.dev".to_string());
+            let target_image = format!("{}/lane-{}:latest", registry_base, short8);
 
-            match run_lane_build(&image_with_digest).await {
+            // Optional digest-form for logging (not strictly required for build/export).
+            let image_with_digest = format!(
+                "{}@{}",
+                target_image.split(':').next().unwrap_or(&target_image),
+                digest
+            );
+
+            info!(
+                "🔧 Mirroring image from source {} to target {}",
+                source_image_with_digest, target_image
+            );
+
+            if let Err(e) = mirror_image_to_registry(&source_image_with_digest, &target_image).await
+            {
+                error!(
+                    "❌ Failed to mirror image into registry (build will likely fail to pull): {}",
+                    e
+                );
+            }
+
+            info!("🔧 Building with registry image: {}", target_image);
+
+            match run_lane_build(&target_image).await {
                 Ok(output) => {
                     info!("✅ Lane build completed successfully");
                     info!("Output: {}", output);
 
-                    match run_lane_export_and_upload(&digest, &image_with_digest).await {
+                    match run_lane_export_and_upload(digest, &target_image).await {
                         Ok(_) => {
                             info!("✅ Lane export completed successfully");
 
-                            let lane_rpc_url = match sprite::deploy_sprite(&digest).await {
+                            let lane_rpc_url = match sprite::deploy_sprite(digest).await {
                                 Ok(result) => {
                                     info!(
                                         "✅ Sprite deployed: {} at {}",
@@ -114,7 +160,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
 
                             let response = NotificationResponse {
                                 message: "✅ Notification processed, Lane build and export completed successfully!".to_string(),
-                                container: image_with_digest,
+                                container: target_image,
                                 status: "Success".to_string(),
                                 timestamp,
                                 lane_rpc_url,
@@ -145,7 +191,7 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
 
                     let response = NotificationResponse {
                         message: format!("❌ Lane build failed: {}", e),
-                        container: image_with_digest,
+                        container: target_image,
                         status: "Failed".to_string(),
                         timestamp,
                         lane_rpc_url: None,
@@ -338,6 +384,66 @@ async fn run_lane_build(
         error!("❌ {}", error_msg);
         Err(error_msg.into())
     }
+}
+
+/// Mirror an image from its original registry (e.g. ttl.sh) into our own registry so that
+/// subsequent `lane build` can pull from a stable, authenticated registry.
+async fn mirror_image_to_registry(
+    source_image_with_digest: &str,
+    target_image_with_digest: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_docker().await?;
+    wait_for_registry_login().await;
+
+    info!(
+        "📦 Mirroring image: {} -> {}",
+        source_image_with_digest, target_image_with_digest
+    );
+
+    let pull_status = TokioCommand::new("docker")
+        .args(["pull", source_image_with_digest])
+        .output()
+        .await?;
+    if !pull_status.status.success() {
+        let stderr = String::from_utf8_lossy(&pull_status.stderr);
+        return Err(format!(
+            "docker pull {} failed: {}",
+            source_image_with_digest, stderr
+        )
+        .into());
+    }
+
+    let tag_status = TokioCommand::new("docker")
+        .args(["tag", source_image_with_digest, target_image_with_digest])
+        .output()
+        .await?;
+    if !tag_status.status.success() {
+        let stderr = String::from_utf8_lossy(&tag_status.stderr);
+        return Err(format!(
+            "docker tag {} {} failed: {}",
+            source_image_with_digest, target_image_with_digest, stderr
+        )
+        .into());
+    }
+
+    let push_status = TokioCommand::new("docker")
+        .args(["push", target_image_with_digest])
+        .output()
+        .await?;
+    if !push_status.status.success() {
+        let stderr = String::from_utf8_lossy(&push_status.stderr);
+        return Err(format!(
+            "docker push {} failed: {}",
+            target_image_with_digest, stderr
+        )
+        .into());
+    }
+
+    info!(
+        "✅ Mirrored image into registry: {}",
+        target_image_with_digest
+    );
+    Ok(())
 }
 
 async fn not_found_handler(uri: Uri) -> impl IntoResponse {
