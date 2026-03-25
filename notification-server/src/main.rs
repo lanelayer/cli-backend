@@ -1,3 +1,4 @@
+mod email;
 mod sprite;
 mod tigris;
 
@@ -12,7 +13,10 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use std::sync::OnceLock;
+
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
@@ -30,6 +34,8 @@ struct LaneNotification {
     platforms: Vec<String>,
     #[serde(default)]
     digest: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,6 +52,69 @@ struct NotificationResponse {
     timestamp: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lane_rpc_url: Option<String>,
+}
+
+fn build_job_semaphore() -> &'static Semaphore {
+    // Lane build/export uses global resources (`/root/lane-export-temp`, Docker prune, etc).
+    // Serializing background jobs avoids concurrency-induced interference.
+    static CELL: OnceLock<Semaphore> = OnceLock::new();
+    CELL.get_or_init(|| Semaphore::new(1))
+}
+
+async fn docker_pull_image(
+    image_with_digest: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_docker().await?;
+
+    info!("🐳 Pulling image: {}", image_with_digest);
+    let pull_status = TokioCommand::new("docker")
+        .args(["pull", image_with_digest])
+        .output()
+        .await?;
+
+    if !pull_status.status.success() {
+        let stderr = String::from_utf8_lossy(&pull_status.stderr);
+        return Err(format!("docker pull {} failed: {}", image_with_digest, stderr).into());
+    }
+
+    Ok(())
+}
+
+async fn tag_and_push_to_registry(
+    source_image_with_digest: &str,
+    target_image_tag: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_docker().await?;
+    wait_for_registry_login().await;
+
+    info!(
+        "🏷️ Tagging and pushing: {} -> {}",
+        source_image_with_digest, target_image_tag
+    );
+
+    let tag_status = TokioCommand::new("docker")
+        .args(["tag", source_image_with_digest, target_image_tag])
+        .output()
+        .await?;
+    if !tag_status.status.success() {
+        let stderr = String::from_utf8_lossy(&tag_status.stderr);
+        return Err(format!(
+            "docker tag {} {} failed: {}",
+            source_image_with_digest, target_image_tag, stderr
+        )
+        .into());
+    }
+
+    let push_status = TokioCommand::new("docker")
+        .args(["push", target_image_tag])
+        .output()
+        .await?;
+    if !push_status.status.success() {
+        let stderr = String::from_utf8_lossy(&push_status.stderr);
+        return Err(format!("docker push {} failed: {}", target_image_tag, stderr).into());
+    }
+
+    Ok(())
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -73,147 +142,11 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
     if let Some(ref digest) = notification.digest {
         info!("   Digest: {}", digest);
     }
+    if let Some(ref session_id) = notification.session_id {
+        info!("   Session ID: {}", session_id);
+    }
 
-    if notification.success {
-        if let Some(digest) = notification.digest.as_deref() {
-            // Require a sha256 digest so we can derive a short ID for the registry image name.
-            if !digest.starts_with("sha256:") {
-                warn!("No valid sha256 digest in notification (got {})", digest);
-                let response = NotificationResponse {
-                    message: "⚠️ Invalid digest format in notification (expected sha256:...)"
-                        .to_string(),
-                    container: notification.original_path.clone(),
-                    status: "Warning".to_string(),
-                    timestamp,
-                    lane_rpc_url: None,
-                };
-                return (StatusCode::OK, Json(response));
-            }
-
-            // 1) Get the first 8 characters after "sha256:" (used to name our registry image).
-            let short = &digest["sha256:".len()..];
-            let short8: String = short.chars().take(8).collect();
-
-            // 2) Source image (where lane CLI pushed the image, e.g. ttl.sh/...)
-            let source_image_with_digest = format!(
-                "{}@{}",
-                notification
-                    .original_path
-                    .split(':')
-                    .next()
-                    .unwrap_or(&notification.original_path),
-                digest
-            );
-
-            // 3) Target image in our own registry, derived from digest: cli-backend-registry.fly.dev/lane-<short8>:latest
-            let registry_base = std::env::var("LANE_REGISTRY_BASE")
-                .unwrap_or_else(|_| "cli-backend-registry.fly.dev".to_string());
-            let target_image = format!("{}/lane-{}:latest", registry_base, short8);
-
-            // Optional digest-form for logging (not strictly required for build/export).
-            let image_with_digest = format!(
-                "{}@{}",
-                target_image.split(':').next().unwrap_or(&target_image),
-                digest
-            );
-
-            info!(
-                "🔧 Mirroring image from source {} to target {}",
-                source_image_with_digest, target_image
-            );
-
-            if let Err(e) = mirror_image_to_registry(&source_image_with_digest, &target_image).await
-            {
-                error!(
-                    "❌ Failed to mirror image into registry (build will likely fail to pull): {}",
-                    e
-                );
-            }
-
-            info!("🔧 Building with registry image: {}", target_image);
-
-            match run_lane_build(&target_image).await {
-                Ok(output) => {
-                    info!("✅ Lane build completed successfully");
-                    info!("Output: {}", output);
-
-                    match run_lane_export_and_upload(digest, &target_image).await {
-                        Ok(_) => {
-                            info!("✅ Lane export completed successfully");
-
-                            let lane_rpc_url = match sprite::deploy_sprite(digest).await {
-                                Ok(result) => {
-                                    info!(
-                                        "✅ Sprite deployed: {} at {}",
-                                        result.sprite_name, result.rpc_url
-                                    );
-                                    Some(result.rpc_url)
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "⚠️ Sprite deploy failed (build/export succeeded): {}",
-                                        e
-                                    );
-                                    None
-                                }
-                            };
-
-                            let response = NotificationResponse {
-                                message: "✅ Notification processed, Lane build and export completed successfully!".to_string(),
-                                container: target_image,
-                                status: "Success".to_string(),
-                                timestamp,
-                                lane_rpc_url,
-                            };
-
-                            (StatusCode::OK, Json(response))
-                        }
-                        Err(e) => {
-                            warn!("⚠️ Lane export failed: {}", e);
-
-                            let response = NotificationResponse {
-                                message: format!(
-                                    "✅ Lane build succeeded but export failed: {}",
-                                    e
-                                ),
-                                container: image_with_digest,
-                                status: "Partial Success".to_string(),
-                                timestamp,
-                                lane_rpc_url: None,
-                            };
-
-                            (StatusCode::OK, Json(response))
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Lane build failed: {}", e);
-
-                    let response = NotificationResponse {
-                        message: format!("❌ Lane build failed: {}", e),
-                        container: target_image,
-                        status: "Failed".to_string(),
-                        timestamp,
-                        lane_rpc_url: None,
-                    };
-
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(response))
-                }
-            }
-        } else {
-            warn!("⚠️ No digest provided in notification");
-
-            let response = NotificationResponse {
-                message: "⚠️ No digest provided in notification".to_string(),
-                container: notification.registry_path,
-                status: "Warning".to_string(),
-                timestamp,
-                lane_rpc_url: None,
-            };
-
-            (StatusCode::OK, Json(response))
-        }
-    } else {
+    if !notification.success {
         warn!("⚠️ Notification indicates failure");
 
         let response = NotificationResponse {
@@ -224,8 +157,185 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
             lane_rpc_url: None,
         };
 
-        (StatusCode::OK, Json(response))
+        return (StatusCode::OK, Json(response));
     }
+
+    let digest = match notification.digest.as_deref() {
+        Some(d) => d,
+        None => {
+            warn!("⚠️ No digest provided in notification");
+            let response = NotificationResponse {
+                message: "⚠️ No digest provided in notification".to_string(),
+                container: notification.registry_path,
+                status: "Warning".to_string(),
+                timestamp,
+                lane_rpc_url: None,
+            };
+            return (StatusCode::OK, Json(response));
+        }
+    };
+
+    // Require a sha256 digest so we can derive a stable short ID for the registry image name.
+    if !digest.starts_with("sha256:") {
+        warn!("No valid sha256 digest in notification (got {})", digest);
+        let response = NotificationResponse {
+            message: "⚠️ Invalid digest format in notification (expected sha256:...)".to_string(),
+            container: notification.original_path,
+            status: "Warning".to_string(),
+            timestamp,
+            lane_rpc_url: None,
+        };
+        return (StatusCode::OK, Json(response));
+    }
+
+    // 1) Get the first 8 characters after "sha256:" (used to name our registry image).
+    let short = &digest["sha256:".len()..];
+    let short8: String = short.chars().take(8).collect();
+
+    // 2) Source image (where lane CLI pushed the image, e.g. ttl.sh/...)
+    let source_image_with_digest = format!(
+        "{}@{}",
+        notification
+            .original_path
+            .split(':')
+            .next()
+            .unwrap_or(&notification.original_path),
+        digest
+    );
+
+    // 3) Target image in our own registry, derived from digest: cli-backend-registry.fly.dev/lane-<short8>:latest
+    let registry_base = std::env::var("LANE_REGISTRY_BASE")
+        .unwrap_or_else(|_| "cli-backend-registry.fly.dev".to_string());
+    let target_image = format!("{}/lane-{}:latest", registry_base, short8);
+
+    // 4) Resolve recipients BEFORE we do any heavy Docker work.
+    let recipients = match email::resolve_recipients(notification.session_id.as_deref()).await {
+        Ok(list) => list,
+        Err(e) => {
+            warn!(
+                "⚠️ Failed to resolve recipients from analytics/fallback list: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    // 5) Gate the background processing on a successful docker pull.
+    // This is the "docker pull the image in the json of the notification" step from feedback.
+    if let Err(e) = docker_pull_image(&source_image_with_digest).await {
+        error!(
+            "❌ Failed to pull source image {}, will not start background deployment: {}",
+            source_image_with_digest, e
+        );
+
+        let response = NotificationResponse {
+            message: format!("❌ Failed to pull image: {}", e),
+            container: target_image,
+            status: "Failed".to_string(),
+            timestamp,
+            lane_rpc_url: None,
+        };
+
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(response));
+    }
+
+    // Move data into background job and return immediately.
+    let recipients_bg = recipients.clone();
+    let original_path = notification.original_path;
+    let registry_path = notification.registry_path;
+    let profile = notification.profile;
+    let platforms = notification.platforms;
+    let digest_owned = digest.to_string();
+    let target_image_bg = target_image.clone();
+    let source_image_bg = source_image_with_digest.clone();
+
+    tokio::spawn(async move {
+        // Serialize because lane build/export manipulates global docker/export state.
+        let _permit = build_job_semaphore().acquire().await;
+
+        // Background step 1: tell user we're starting deployment.
+        if let Err(e) = email::send_lane_push_started_email(
+            &recipients_bg,
+            &original_path,
+            &registry_path,
+            Some(&digest_owned),
+            &profile,
+            &platforms,
+        )
+        .await
+        {
+            warn!("⚠️ Failed to send lane push started email: {}", e);
+        }
+
+        // Background step 2: mirror/tag the pulled image into our stable registry.
+        if let Err(e) = tag_and_push_to_registry(&source_image_bg, &target_image_bg).await {
+            error!(
+                "❌ Failed to tag/push image for lane build: {} (image {})",
+                e, target_image_bg
+            );
+            return;
+        }
+
+        // Background step 3: lane build + export + sprite deployment.
+        if let Err(e) = run_lane_build(&target_image_bg).await {
+            error!("❌ Lane build failed in background job: {}", e);
+            return;
+        }
+
+        if let Err(e) = run_lane_export_and_upload(&digest_owned, &target_image_bg).await {
+            warn!("⚠️ Lane export failed in background job: {}", e);
+            return;
+        }
+
+        let lane_rpc_url = match sprite::deploy_sprite(&digest_owned).await {
+            Ok(result) => {
+                info!(
+                    "✅ Sprite deployed: {} at {}",
+                    result.sprite_name, result.rpc_url
+                );
+                if let Err(e) = tigris::upsert_active_sprite(
+                    &result.sprite_name,
+                    &result.rpc_url,
+                    &digest_owned,
+                )
+                .await
+                {
+                    warn!("⚠️ Failed to upsert sprite active index in Tigris: {}", e);
+                }
+                Some(result.rpc_url)
+            }
+            Err(e) => {
+                warn!("⚠️ Sprite deploy failed (build/export succeeded): {}", e);
+                None
+            }
+        };
+
+        // Background step 4: email only when RPC is actually available.
+        if let Some(ref rpc_url) = lane_rpc_url {
+            if let Err(e) = email::send_lane_push_success_email(
+                &recipients_bg,
+                &target_image_bg,
+                &digest_owned,
+                Some(rpc_url),
+            )
+            .await
+            {
+                warn!("⚠️ Failed to send lane push success email: {}", e);
+            }
+        } else {
+            warn!("Lane build/export succeeded but RPC deploy failed; skipping RPC email");
+        }
+    });
+
+    let response = NotificationResponse {
+        message: "✅ Notification received; lane deployment queued".to_string(),
+        container: target_image,
+        status: "Queued".to_string(),
+        timestamp,
+        lane_rpc_url: None,
+    };
+
+    (StatusCode::OK, Json(response))
 }
 
 async fn log_disk_space(label: &str) {
@@ -384,66 +494,6 @@ async fn run_lane_build(
         error!("❌ {}", error_msg);
         Err(error_msg.into())
     }
-}
-
-/// Mirror an image from its original registry (e.g. ttl.sh) into our own registry so that
-/// subsequent `lane build` can pull from a stable, authenticated registry.
-async fn mirror_image_to_registry(
-    source_image_with_digest: &str,
-    target_image_with_digest: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    wait_for_docker().await?;
-    wait_for_registry_login().await;
-
-    info!(
-        "📦 Mirroring image: {} -> {}",
-        source_image_with_digest, target_image_with_digest
-    );
-
-    let pull_status = TokioCommand::new("docker")
-        .args(["pull", source_image_with_digest])
-        .output()
-        .await?;
-    if !pull_status.status.success() {
-        let stderr = String::from_utf8_lossy(&pull_status.stderr);
-        return Err(format!(
-            "docker pull {} failed: {}",
-            source_image_with_digest, stderr
-        )
-        .into());
-    }
-
-    let tag_status = TokioCommand::new("docker")
-        .args(["tag", source_image_with_digest, target_image_with_digest])
-        .output()
-        .await?;
-    if !tag_status.status.success() {
-        let stderr = String::from_utf8_lossy(&tag_status.stderr);
-        return Err(format!(
-            "docker tag {} {} failed: {}",
-            source_image_with_digest, target_image_with_digest, stderr
-        )
-        .into());
-    }
-
-    let push_status = TokioCommand::new("docker")
-        .args(["push", target_image_with_digest])
-        .output()
-        .await?;
-    if !push_status.status.success() {
-        let stderr = String::from_utf8_lossy(&push_status.stderr);
-        return Err(format!(
-            "docker push {} failed: {}",
-            target_image_with_digest, stderr
-        )
-        .into());
-    }
-
-    info!(
-        "✅ Mirrored image into registry: {}",
-        target_image_with_digest
-    );
-    Ok(())
 }
 
 async fn not_found_handler(uri: Uri) -> impl IntoResponse {

@@ -36,3 +36,6 @@ primary_region = 'cdg'
 [[mounts]]
   source = "data"
   destination = "/data"
+
+[env]
+  LANELAYER_ANALYTICS_BASE_URL = "https://lanelayer-analytics.fly.dev"
