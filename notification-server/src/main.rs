@@ -3,8 +3,9 @@ mod sprite;
 mod tigris;
 
 use axum::{
+    extract::Extension,
     extract::Json,
-    http::{Request, StatusCode, Uri},
+    http::{header, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,6 +21,9 @@ use tokio::sync::Semaphore;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
+#[derive(Clone, Debug)]
+struct NotifyForwardAuthToken(Option<String>);
+
 #[derive(Debug, Deserialize)]
 struct LaneNotification {
     #[serde(rename = "type")]
@@ -34,8 +38,11 @@ struct LaneNotification {
     platforms: Vec<String>,
     #[serde(default)]
     digest: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
+    /// Lane Analytics session token used to resolve recipient email.
+    ///
+    /// Accepts `session` (preferred) and also tolerates legacy payloads using `session_id`.
+    #[serde(default, alias = "session_id")]
+    session: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +59,66 @@ struct NotificationResponse {
     timestamp: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lane_rpc_url: Option<String>,
+}
+
+/// If `LANE_NOTIFY_BEARER_TOKEN` is set, require `Authorization: Bearer <token>` for `POST /notify`.
+///
+/// If unset/empty, auth is disabled (useful for local dev), and requests are allowed through.
+async fn notify_auth_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let expected = std::env::var("LANE_NOTIFY_BEARER_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Capture the user-provided bearer token (if any) so we can reuse it for analytics lookup.
+    let forwarded_token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Auth disabled (local/dev) when env var isn't set.
+    let Some(expected_token) = expected else {
+        let mut req = req;
+        req.extensions_mut()
+            .insert(NotifyForwardAuthToken(forwarded_token));
+        return next.run(req).await;
+    };
+
+    // Preferred: allow a dedicated header for the server-side webhook secret so we can
+    // still forward the *user* Authorization bearer token to analytics.
+    let webhook_token_header = req
+        .headers()
+        .get("x-lane-notify-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut authed = false;
+
+    if let Some(t) = webhook_token_header {
+        authed = t == expected_token;
+    } else if let Some(ref t) = forwarded_token {
+        // Backward compatible: allow Authorization bearer token to act as webhook secret.
+        authed = t == &expected_token;
+    }
+
+    if !authed {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Unauthorized (provide x-lane-notify-token or Authorization bearer token)",
+        )
+            .into_response();
+    }
+
+    let mut req = req;
+    req.extensions_mut()
+        .insert(NotifyForwardAuthToken(forwarded_token));
+    next.run(req).await
 }
 
 fn build_job_semaphore() -> &'static Semaphore {
@@ -128,7 +195,10 @@ async fn health_handler() -> impl IntoResponse {
 }
 
 #[axum::debug_handler]
-async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl IntoResponse {
+async fn notify_handler(
+    Extension(forwarded): Extension<NotifyForwardAuthToken>,
+    Json(notification): Json<LaneNotification>,
+) -> impl IntoResponse {
     let timestamp = Utc::now();
 
     info!("📢 Lane Notification Received:");
@@ -142,8 +212,8 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
     if let Some(ref digest) = notification.digest {
         info!("   Digest: {}", digest);
     }
-    if let Some(ref session_id) = notification.session_id {
-        info!("   Session ID: {}", session_id);
+    if let Some(ref session) = notification.session {
+        info!("   Session ID: {}", session);
     }
 
     if !notification.success {
@@ -209,16 +279,28 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
     let target_image = format!("{}/lane-{}:latest", registry_base, short8);
 
     // 4) Resolve recipients BEFORE we do any heavy Docker work.
-    let recipients = match email::resolve_recipients(notification.session_id.as_deref()).await {
-        Ok(list) => list,
-        Err(e) => {
-            warn!(
-                "⚠️ Failed to resolve recipients from analytics/fallback list: {}",
-                e
-            );
-            Vec::new()
-        }
-    };
+    let recipients =
+        match email::resolve_recipients(notification.session.as_deref(), forwarded.0.as_deref())
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                warn!(
+                    "⚠️ Failed to resolve recipients from analytics/fallback list: {}",
+                    e
+                );
+                Vec::new()
+            }
+        };
+
+    if recipients.is_empty() {
+        info!("📭 No recipients resolved (no analytics email and no RESEND_TO_EMAILS fallback)");
+    } else {
+        info!(
+            "📬 Resolved {} recipient(s) for notifications",
+            recipients.len()
+        );
+    }
 
     // 5) Gate the background processing on a successful docker pull.
     // This is the "docker pull the image in the json of the notification" step from feedback.
@@ -253,8 +335,10 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
         // Serialize because lane build/export manipulates global docker/export state.
         let _permit = build_job_semaphore().acquire().await;
 
-        // Background step 1: tell user we're starting deployment.
-        if let Err(e) = email::send_lane_push_started_email(
+        // Background step 1: tell user we're starting deployment (only if we resolved a recipient).
+        if recipients_bg.is_empty() {
+            info!("📭 No recipient email resolved; skipping start/success emails");
+        } else if let Err(e) = email::send_lane_push_started_email(
             &recipients_bg,
             &original_path,
             &registry_path,
@@ -310,8 +394,10 @@ async fn notify_handler(Json(notification): Json<LaneNotification>) -> impl Into
             }
         };
 
-        // Background step 4: email only when RPC is actually available.
-        if let Some(ref rpc_url) = lane_rpc_url {
+        // Background step 4: email only when RPC is actually available, and we have a recipient.
+        if recipients_bg.is_empty() {
+            // already logged above
+        } else if let Some(ref rpc_url) = lane_rpc_url {
             if let Err(e) = email::send_lane_push_success_email(
                 &recipients_bg,
                 &target_image_bg,
@@ -607,7 +693,10 @@ async fn async_main() {
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/notify", post(notify_handler))
+        .route(
+            "/notify",
+            post(notify_handler).route_layer(middleware::from_fn(notify_auth_middleware)),
+        )
         .fallback(not_found_handler)
         .layer(middleware::from_fn(logging_middleware));
 
