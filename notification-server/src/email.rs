@@ -1,5 +1,14 @@
 use reqwest::Client;
 use serde_json::{json, Value};
+use tracing::{info, warn};
+
+fn redact_token(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() <= 8 {
+        return "***".to_string();
+    }
+    format!("{}...{}", &trimmed[..4], &trimmed[trimmed.len() - 4..])
+}
 
 /// Best-effort Resend email sender for lane push lifecycle notifications.
 fn resend_config() -> Result<(String, String, Vec<String>), String> {
@@ -54,107 +63,133 @@ fn extract_email_from_analytics_payload(body: &Value) -> Option<String> {
     None
 }
 
-/// Fetch the recipient email from lanelayer-analytics, if available.
+/// Fetch recipient email from lane-analytics, if available.
 ///
-/// Required env var for lookup:
+/// Required env var:
 /// - `LANELAYER_ANALYTICS_BASE_URL`
 ///
 /// Optional env vars:
-/// - `LANELAYER_ANALYTICS_AUTH_TOKEN` (optional; when set, uses `/api/v1/auth/email/{session_id}` first)
-/// - `LANELAYER_ANALYTICS_EMAIL_PATH` (optional; defaults to `/api/v1/auth/email/{session_id}`; `{session_id}` replaced)
-/// - `LANELAYER_ANALYTICS_STATUS_PATH` (optional; defaults to `/api/v1/auth/status`)
-/// - `LANELAYER_ANALYTICS_SESSION_QUERY_PARAM` (optional; defaults to `session`; used for `/api/v1/auth/status?session=...`)
+/// - `LANELAYER_ANALYTICS_STATUS_PATH` (defaults to `/api/v1/auth/status`)
+/// - `LANELAYER_ANALYTICS_SESSION_QUERY_PARAM` (defaults to `session`)
 pub async fn fetch_email_from_analytics(
     session_id: &str,
+    bearer_token: Option<&str>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let base_url = match std::env::var("LANELAYER_ANALYTICS_BASE_URL") {
         Ok(v) if !v.trim().is_empty() => v.trim_end_matches('/').to_string(),
-        _ => return Ok(None),
+        _ => {
+            info!(
+                "📭 Analytics lookup skipped: LANELAYER_ANALYTICS_BASE_URL not configured (session={})",
+                session_id
+            );
+            return Ok(None);
+        }
     };
 
-    // The newer endpoint returns the email as *plain text* and requires auth.
-    // In lanelayer-analytics this is:
-    //   GET /api/v1/auth/email/:session_id
-    // with `Authorization: Bearer <auth_token>` (or `?auth_token=...`).
-    let auth_token = std::env::var("LANELAYER_ANALYTICS_AUTH_TOKEN")
-        .ok()
-        .and_then(|v| {
-            let t = v.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        });
-
-    let email_path_template = std::env::var("LANELAYER_ANALYTICS_EMAIL_PATH")
-        .unwrap_or_else(|_| "/api/v1/auth/email/{session_id}".to_string());
-
-    if let Some(token) = auth_token.as_ref() {
-        let email_path = email_path_template.replace("{session_id}", session_id);
-        let email_url = format!("{}/{}", base_url, email_path.trim_start_matches('/'));
-
-        let response = Client::new()
-            .get(&email_url)
-            .bearer_auth(token)
-            .query(&[("auth_token", token)])
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let email_text = response.text().await.unwrap_or_default();
-            let trimmed = email_text.trim();
-            if !trimmed.is_empty() {
-                return Ok(Some(trimmed.to_string()));
-            }
-        }
-    }
-
-    // Fallback: the status endpoint is public and returns JSON with `{ verified, email }`:
-    //   GET /api/v1/auth/status?session=<session_id>
     let status_path = std::env::var("LANELAYER_ANALYTICS_STATUS_PATH")
         .unwrap_or_else(|_| "/api/v1/auth/status".to_string());
     let session_query_param = std::env::var("LANELAYER_ANALYTICS_SESSION_QUERY_PARAM")
         .unwrap_or_else(|_| "session".to_string());
-
     let status_url = format!("{}/{}", base_url, status_path.trim_start_matches('/'));
 
-    let response = Client::new()
+    let analytics_auth_token = bearer_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            std::env::var("LANELAYER_ANALYTICS_AUTH_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
+    info!(
+        "🔎 Analytics lookup: url={} query_param={} session={} auth={}",
+        status_url,
+        session_query_param,
+        session_id,
+        match analytics_auth_token.as_deref() {
+            Some(t) => format!("bearer({})", redact_token(t)),
+            None => "none".to_string(),
+        }
+    );
+
+    let client = Client::new();
+    let mut req = client
         .get(&status_url)
-        .query(&[(session_query_param.as_str(), session_id)])
-        .send()
-        .await?;
+        .query(&[(session_query_param.as_str(), session_id)]);
+
+    if let Some(token) = analytics_auth_token {
+        req = req.bearer_auth(token);
+    }
+
+    let response = req.send().await?;
 
     if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        warn!(
+            "⚠️ Analytics lookup failed: status={} body={}",
+            status,
+            body.chars().take(240).collect::<String>()
+        );
         return Ok(None);
     }
 
     let body: Value = response.json().await?;
-
-    // If the API includes an explicit "verified" gate, respect it (when present).
+    info!("✅ Analytics lookup succeeded (session={})", session_id);
     let verified = body.get("verified").and_then(|v| v.as_bool());
     if verified == Some(false) {
+        warn!(
+            "⚠️ Analytics returned verified=false for session={}",
+            session_id
+        );
         return Ok(None);
     }
 
-    Ok(extract_email_from_analytics_payload(&body))
+    let resolved = extract_email_from_analytics_payload(&body);
+    if resolved.is_none() {
+        warn!(
+            "⚠️ Analytics payload had no usable email fields for session={}",
+            session_id
+        );
+    }
+    Ok(resolved)
 }
 
 /// Priority:
 /// 1) analytics email for provided session_id
-/// 2) `RESEND_TO_EMAILS` fallback list
+/// 2) fallback list from `RESEND_TO_EMAILS` (if configured)
+/// 3) no email (skip notification)
 pub async fn resolve_recipients(
     session_id: Option<&str>,
+    analytics_bearer_token: Option<&str>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(sid) = session_id {
         if !sid.trim().is_empty() {
-            if let Some(email) = fetch_email_from_analytics(sid).await? {
+            if let Some(email) = fetch_email_from_analytics(sid, analytics_bearer_token).await? {
+                info!("📬 Resolved recipient from analytics: {}", email);
                 return Ok(vec![email]);
             }
+            info!("📭 Analytics did not return an email; trying RESEND_TO_EMAILS fallback");
         }
     }
-    let (_, _, recipients) = resend_config().map_err(|e| e.to_string())?;
-    Ok(recipients)
+
+    // Fall back to static recipients list (useful for dev / ops visibility).
+    // If not configured, silently return empty.
+    match resend_config() {
+        Ok((_api_key, _from, recipients)) => {
+            info!(
+                "📬 Using RESEND_TO_EMAILS fallback recipients (count={})",
+                recipients.len()
+            );
+            Ok(recipients)
+        }
+        Err(e) => {
+            warn!("⚠️ No fallback recipients configured: {}", e);
+            Ok(Vec::new())
+        }
+    }
 }
 
 pub async fn send_lane_push_started_email(
@@ -216,6 +251,11 @@ async fn send_resend_email(
     if recipients.is_empty() {
         return Err("No recipients provided".into());
     }
+    info!(
+        "✉️ Sending email via Resend: recipients={} subject=\"{}\"",
+        recipients.join(","),
+        subject
+    );
     let (api_key, from, _) = resend_config().map_err(|e| e.to_string())?;
     let client = Client::new();
 
@@ -239,5 +279,6 @@ async fn send_resend_email(
         return Err(format!("Resend request failed ({}): {}", status, body).into());
     }
 
+    info!("✅ Resend accepted email request");
     Ok(())
 }
